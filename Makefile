@@ -750,7 +750,7 @@ else
 KBUILD_CFLAGS	+= $(OPT_FLAGS)
 KBUILD_AFLAGS   += $(OPT_FLAGS)
 ifdef CONFIG_LTO_CLANG
-KBUILD_LDFLAGS += --plugin-opt=O3 --strip-debug -march=armv8.2-a+dotprod -mcpu=cortex-a55+crypto+crc
+KBUILD_LDFLAGS += --plugin-opt=O3 --strip-debug -march=armv8.2-a+dotprod -mcpu=cortex-a55+crypto+crc -mllvm -regalloc-enable-advisor=release
 else
 KBUILD_LDFLAGS += $(OPT_FLAGS)
 endif
