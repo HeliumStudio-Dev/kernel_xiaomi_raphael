@@ -14,7 +14,6 @@
 #include <linux/seq_file.h>
 #include <linux/stacktrace.h>
 #include <linux/string.h>
-#include <trace/events/error_report.h>
 
 #include <asm/kfence.h>
 
@@ -247,7 +246,6 @@ void kfence_report_error(unsigned long address, bool is_write, struct pt_regs *r
 		show_regs(regs);
 	else
 		dump_stack_print_info(KERN_ERR);
-	trace_error_report_end(ERROR_DETECTOR_KFENCE, address);
 	pr_err("==================================================================\n");
 
 	lockdep_on();
