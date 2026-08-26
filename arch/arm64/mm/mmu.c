@@ -471,12 +471,7 @@ static void __init map_mem(pgd_t *pgd)
 	struct memblock_region *reg;
 	int flags = 0;
 
-	/*
-	 * KFENCE requires linear map to be mapped at page granularity, so that
-	 * it is possible to protect/unprotect single pages in the KFENCE pool.
-	 */
-	if (debug_pagealloc_enabled() ||
-		IS_ENABLED(CONFIG_KFENCE))
+	if (debug_pagealloc_enabled())
 		flags = NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS;
 
 	/*
