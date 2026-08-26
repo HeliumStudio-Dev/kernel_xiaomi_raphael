@@ -3987,7 +3987,7 @@ const char *__check_heap_object(const void *ptr, unsigned long n,
 }
 #endif /* CONFIG_HARDENED_USERCOPY */
 
-size_t __ksize(const void *object)
+static size_t __ksize(const void *object)
 {
 	struct page *page;
 
@@ -4003,7 +4003,17 @@ size_t __ksize(const void *object)
 
 	return slab_ksize(page->slab_cache);
 }
-EXPORT_SYMBOL(__ksize);
+
+size_t ksize(const void *object)
+{
+	size_t size = __ksize(object);
+	/* We assume that ksize callers could use whole allocated area,
+	 * so we need to unpoison this area.
+	 */
+	kasan_unpoison_shadow(object, size);
+	return size;
+}
+EXPORT_SYMBOL(ksize);
 
 void kfree(const void *x)
 {
