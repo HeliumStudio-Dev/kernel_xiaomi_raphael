@@ -1,9 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * KFENCE guarded object allocator and fault handling.
- *
- * Copyright (C) 2020, Google LLC.
- */
 
 #define pr_fmt(fmt) "kfence: " fmt
 
