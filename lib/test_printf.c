@@ -24,8 +24,8 @@
 #define PAD_SIZE 16
 #define FILL_CHAR '$'
 
-KSTM_MODULE_GLOBALS();
-
+static unsigned total_tests __initdata;
+static unsigned failed_tests __initdata;
 static char *test_buffer __initdata;
 static char *alloced_buffer __initdata;
 
