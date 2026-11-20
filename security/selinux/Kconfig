@@ -1,6 +1,6 @@
 config SECURITY_SELINUX
 	bool "NSA SELinux Support"
-	depends on SECURITY_NETWORK && AUDIT && NET && INET
+	depends on SECURITY_NETWORK && NET && INET
 	select NETWORK_SECMARK
 	default n
 	help
@@ -59,6 +59,16 @@ config SECURITY_SELINUX_DEVELOP
 	  can interactively toggle the kernel between enforcing mode and
 	  permissive mode (if permitted by the policy) via
 	  /sys/fs/selinux/enforce.
+
+config SECURITY_SELINUX_CMDLINE_CONTROL
+	bool "Control behavior the androidboot.selinux cmdline"
+	depends on SECURITY_SELINUX_DEVELOP
+	default y
+	help
+	  Some system no longer accept the androidboot.selinux parameter,
+	  causing the Android system core init to always treat isEnforceing
+	  as true, write 1 to /sys/fs/selinux/enforce. This config is used
+	  to control the behavior of selinuxfs on enforce_store.
 
 config SECURITY_SELINUX_AVC_STATS
 	bool "NSA SELinux AVC Statistics"

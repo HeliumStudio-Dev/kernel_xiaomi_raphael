@@ -68,6 +68,7 @@ configure specific aspects of kernel behavior to your liking.
    java
    ras
    pm/index
+   mm/multigen_lru
    thunderbolt
    LSM/index
 

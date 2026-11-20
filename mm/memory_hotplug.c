@@ -1059,6 +1059,7 @@ static pg_data_t __ref *hotadd_new_pgdat(int nid, u64 start)
 
 static void rollback_node_hotadd(int nid, pg_data_t *pgdat)
 {
+	lru_gen_exit_pgdat(pgdat);
 	arch_refresh_nodedata(nid, NULL);
 	free_percpu(pgdat->per_cpu_nodestats);
 	arch_free_nodedata(pgdat);

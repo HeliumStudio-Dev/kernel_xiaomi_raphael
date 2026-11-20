@@ -292,18 +292,6 @@ config MSM_CAMCC_SM8150
           Say Y if you want to support camera devices and functionality such as
 	  capturing pictures.
 
-config CLOCK_CPU_OSM
-	tristate "OSM CPU Clock Controller"
-	depends on COMMON_CLK_QCOM
-	help
-	 Support for the OSM clock controller.
-	 Operating State Manager (OSM) is a hardware engine used by some
-	 Qualcomm Technologies, Inc. (QTI) SoCs to manage frequency and
-	 voltage scaling in hardware. OSM is capable of controlling
-	 frequency and voltage requests for multiple clusters via the
-	 existence of multiple OSM domains.
-	 Say Y if you want to support OSM clocks.
-
 config CLOCK_CPU_OSM_660
 	tristate "OSM CPU Clock Controller for SDM660"
 	depends on COMMON_CLK_QCOM

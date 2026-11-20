@@ -27,6 +27,13 @@
 		{RECLAIM_WB_ASYNC,	"RECLAIM_WB_ASYNC"}	\
 		) : "RECLAIM_WB_NONE"
 
+#define _VMSCAN_THROTTLE_WRITEBACK	(1 << VMSCAN_THROTTLE_WRITEBACK)
+
+#define show_throttle_flags(flags)						\
+	(flags) ? __print_flags(flags, "|",					\
+		{_VMSCAN_THROTTLE_WRITEBACK,	"VMSCAN_THROTTLE_WRITEBACK"}	\
+		) : "VMSCAN_THROTTLE_NONE"
+
 #define trace_reclaim_flags(page) ( \
 	(page_is_file_cache(page) ? RECLAIM_WB_FILE : RECLAIM_WB_ANON) | \
 	(RECLAIM_WB_ASYNC) \
@@ -463,6 +470,32 @@ TRACE_EVENT(mm_vmscan_inactive_list_is_low,
 		__entry->total_active, __entry->active,
 		__entry->ratio,
 		show_reclaim_flags(__entry->reclaim_flags))
+);
+TRACE_EVENT(mm_vmscan_throttled,
+
+	TP_PROTO(int nid, int usec_timeout, int usec_delayed, int reason),
+
+	TP_ARGS(nid, usec_timeout, usec_delayed, reason),
+
+	TP_STRUCT__entry(
+		__field(int, nid)
+		__field(int, usec_timeout)
+		__field(int, usec_delayed)
+		__field(int, reason)
+	),
+
+	TP_fast_assign(
+		__entry->nid = nid;
+		__entry->usec_timeout = usec_timeout;
+		__entry->usec_delayed = usec_delayed;
+		__entry->reason = 1U << reason;
+	),
+
+	TP_printk("nid=%d usec_timeout=%d usect_delayed=%d reason=%s",
+		__entry->nid,
+		__entry->usec_timeout,
+		__entry->usec_delayed,
+		show_throttle_flags(__entry->reason))
 );
 #endif /* _TRACE_VMSCAN_H */
 

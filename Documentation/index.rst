@@ -67,6 +67,7 @@ needed).
 
    driver-api/index
    core-api/index
+   mm/multigen_lru
    media/index
    networking/index
    input/index

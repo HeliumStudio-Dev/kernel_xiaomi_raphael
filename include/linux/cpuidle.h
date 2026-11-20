@@ -259,22 +259,40 @@ static inline int cpuidle_register_governor(struct cpuidle_governor *gov)
 {return 0;}
 #endif
 
-#define CPU_PM_CPU_IDLE_ENTER(low_level_idle_enter, idx)	\
-({								\
-	int __ret;						\
-								\
-	if (!idx) {						\
-		cpu_do_idle();					\
-		return idx;					\
-	}							\
-								\
-	__ret = cpu_pm_enter();					\
-	if (!__ret) {						\
-		__ret = low_level_idle_enter(idx);		\
-		cpu_pm_exit();					\
-	}							\
-								\
-	__ret ? -1 : idx;					\
+#define __CPU_PM_CPU_IDLE_ENTER(low_level_idle_enter, idx, is_retention) \
+({									\
+	int __ret = 0;							\
+									\
+	if (need_resched()) {						\
+		__ret = -1;						\
+	} else if (!idx) {						\
+		cpu_do_idle();						\
+	} else {							\
+		if (!is_retention)					\
+			__ret = cpu_pm_enter();				\
+		if (!__ret) {						\
+			__ret = low_level_idle_enter(idx);		\
+			if (!is_retention)				\
+				cpu_pm_exit();				\
+		}							\
+	}								\
+									\
+	__ret ? -1 : idx;						\
 })
+
+#define CPU_PM_CPU_IDLE_ENTER(low_level_idle_enter, idx)	\
+	__CPU_PM_CPU_IDLE_ENTER(low_level_idle_enter, idx, 0)
+
+#define CPU_PM_CPU_IDLE_ENTER_RETENTION(low_level_idle_enter, idx)	\
+	__CPU_PM_CPU_IDLE_ENTER(low_level_idle_enter, idx, 1)
+
+#ifdef CONFIG_MSM_PM
+extern bool lpm_sleep_disabled(void);
+#else
+static bool lpm_sleep_disabled(void)
+{
+	return false;
+}
+#endif
 
 #endif /* _LINUX_CPUIDLE_H */

@@ -1027,37 +1027,9 @@ config PANIC_TIMEOUT
 	  value n > 0 will wait n seconds before rebooting, while a timeout
 	  value n < 0 will reboot immediately.
 
-config SCHED_DEBUG
-	bool "Collect scheduler debugging info"
-	depends on DEBUG_KERNEL && PROC_FS
-	default y
-	help
-	  If you say Y here, the /proc/sched_debug file will be provided
-	  that can help debug the scheduler. The runtime overhead of this
-	  option is minimal.
-
 config SCHED_INFO
 	bool
 	default n
-
-config PANIC_ON_SCHED_BUG
-	bool "Panic on all bugs encountered by the scheduler"
-	help
-	  Say Y here to panic on all 'BUG:' conditions encountered by the
-	  scheduler, even potentially-recoverable ones such as scheduling
-	  while atomic, sleeping from invalid context, and detection of
-	  broken arch topologies.
-
-	  Say N if unsure.
-
-config PANIC_ON_RT_THROTTLING
-	bool "Panic on RT throttling"
-	help
-	  Say Y here to enable the kernel to panic when a realtime
-	  runqueue is throttled. This may be useful for detecting
-	  and debugging RT throttling issues.
-
-	  Say N if unsure.
 
 config SCHEDSTATS
 	bool "Collect scheduler statistics"
@@ -1181,6 +1153,13 @@ config DEBUG_WW_MUTEX_SLOWPATH
 	 even a debug kernel.  If you are a driver writer, enable it.  If
 	 you are a distro, do not.
 
+config DEBUG_RWSEMS
+	bool "RW Semaphore debugging: basic checks"
+	depends on DEBUG_KERNEL && RWSEM_SPIN_ON_OWNER
+	help
+	  This debugging feature allows mismatched rw semaphore locks and unlocks
+	  to be detected and reported.
+
 config DEBUG_LOCK_ALLOC
 	bool "Lock debugging: detect incorrect freeing of live locks"
 	depends on DEBUG_KERNEL && TRACE_IRQFLAGS_SUPPORT && STACKTRACE_SUPPORT && LOCKDEP_SUPPORT
@@ -1203,6 +1182,7 @@ config PROVE_LOCKING
 	select DEBUG_SPINLOCK
 	select DEBUG_MUTEXES
 	select DEBUG_RT_MUTEXES if RT_MUTEXES
+	select DEBUG_RWSEMS if RWSEM_SPIN_ON_OWNER
 	select DEBUG_LOCK_ALLOC
 	select LOCKDEP_CROSSRELEASE if BROKEN
 	select LOCKDEP_COMPLETIONS if BROKEN
@@ -2120,6 +2100,16 @@ config PANIC_ON_DATA_CORRUPTION
 	 Select this option to upgrade warnings for potentially
 	 recoverable data corruption scenarios to system-halting panics,
 	 for easier detection and debug.
+
+config CC_WERROR
+	bool "Treat all compile warnings as errors"
+	default n
+	help
+	  Select this option to set compiler warnings as errors,
+	  to prevent easily-fixable problems from creeping into
+	  the codebase.
+
+	  If unsure, say N.
 
 source "samples/Kconfig"
 

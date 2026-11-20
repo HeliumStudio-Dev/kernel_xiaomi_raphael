@@ -74,6 +74,28 @@
 
 int suid_dumpable = 0;
 
+#define PERFHAL_BIN "/vendor/bin/hw/vendor.qti.hardware.perf@2.2-service"
+
+static struct task_struct *perfhal_tsk;
+bool task_is_perfhal(struct task_struct *p)
+{
+	struct task_struct *tsk;
+	bool ret;
+
+	rcu_read_lock();
+	tsk = READ_ONCE(perfhal_tsk);
+	ret = tsk && same_thread_group(p, tsk);
+	rcu_read_unlock();
+
+	return ret;
+}
+
+void dead_special_task(void)
+{
+	if (unlikely(current == perfhal_tsk))
+		WRITE_ONCE(perfhal_tsk, NULL);
+}
+
 static LIST_HEAD(formats);
 static DEFINE_RWLOCK(binfmt_lock);
 
@@ -1042,9 +1064,11 @@ static int exec_mmap(struct mm_struct *mm)
 	activate_mm(active_mm, mm);
 	if (IS_ENABLED(CONFIG_ARCH_WANT_IRQS_OFF_ACTIVATE_MM))
 		local_irq_enable();
+	lru_gen_add_mm(mm);
 	tsk->mm->vmacache_seqnum = 0;
 	vmacache_flush(tsk);
 	task_unlock(tsk);
+	lru_gen_use_mm(mm);
 	if (old_mm) {
 		up_read(&old_mm->mmap_sem);
 		BUG_ON(active_mm != old_mm);
@@ -1842,6 +1866,11 @@ static int __do_execve_file(int fd, struct filename *filename,
 	retval = exec_binprm(bprm);
 	if (retval < 0)
 		goto out;
+
+	if (is_global_init(current->parent)) {
+		if (unlikely(!strcmp(filename->name, PERFHAL_BIN)))
+			WRITE_ONCE(perfhal_tsk, current);
+	}
 
 	/* execve succeeded */
 	current->fs->in_exec = 0;

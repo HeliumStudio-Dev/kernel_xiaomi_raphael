@@ -1,4 +1,5 @@
 /* Copyright (c) 2016-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -36,10 +37,6 @@
 #include <soc/qcom/scm.h>
 
 #include "../thermal_core.h"
-#include "lmh_dbg.h"
-
-#define CREATE_TRACE_POINTS
-#include <trace/events/lmh.h>
 
 #define LIMITS_DCVSH			0x10
 #define LIMITS_PROFILE_CHANGE		0x01
@@ -144,11 +141,11 @@ static unsigned long limits_mitigation_notify(struct limits_dcvs_hw *hw)
 {
 	uint32_t val = 0, max_cpu_ct = 0, max_cpu_limit = 0, idx = 0, cpu = 0;
 	struct device *cpu_dev = NULL;
-	unsigned long freq_val, max_limit = 0;
+	unsigned long freq_val = 0, lmh_max_limit = 0;
 	struct dev_pm_opp *opp_entry;
 
 	val = readl_relaxed(hw->osm_hw_reg);
-	dcvsh_get_frequency(val, max_limit);
+	dcvsh_get_frequency(val, lmh_max_limit);
 	for_each_cpu(cpu, &hw->core_map) {
 		cpu_dev = get_cpu_device(cpu);
 		if (!cpu_dev) {
@@ -159,8 +156,8 @@ static unsigned long limits_mitigation_notify(struct limits_dcvs_hw *hw)
 
 		pr_debug("CPU:%d max value read:%lu\n",
 			cpumask_first(&hw->core_map),
-			max_limit);
-		freq_val = FREQ_KHZ_TO_HZ(max_limit);
+			lmh_max_limit);
+		freq_val = FREQ_KHZ_TO_HZ(lmh_max_limit);
 		opp_entry = dev_pm_opp_find_freq_floor(cpu_dev, &freq_val);
 		/*
 		 * Hardware mitigation frequency can be lower than the lowest
@@ -183,25 +180,27 @@ static unsigned long limits_mitigation_notify(struct limits_dcvs_hw *hw)
 			idx++;
 			continue;
 		}
-		max_limit = FREQ_HZ_TO_KHZ(freq_val);
+		lmh_max_limit = FREQ_HZ_TO_KHZ(freq_val);
 		break;
 	}
 
 	if (max_cpu_ct == cpumask_weight(&hw->core_map))
-		max_limit = max_cpu_limit;
-	sched_update_cpu_freq_min_max(&hw->core_map, 0, max_limit);
-	pr_debug("CPU:%d max limit:%lu\n", cpumask_first(&hw->core_map),
-			max_limit);
-	trace_lmh_dcvs_freq(cpumask_first(&hw->core_map), max_limit);
+		lmh_max_limit = max_cpu_limit;
+
+	/* Update thermal pressure (the boost frequencies are accepted) */
+	arch_update_thermal_pressure(&hw->core_map, lmh_max_limit);
+
+	pr_debug("CPU:%d lmh_limit:%lu\n", cpumask_first(&hw->core_map),
+			lmh_max_limit);
 
 notify_exit:
-	hw->hw_freq_limit = max_limit;
-	return max_limit;
+	hw->hw_freq_limit = lmh_max_limit;
+	return lmh_max_limit;
 }
 
 static void limits_dcvs_poll(struct work_struct *work)
 {
-	unsigned long max_limit = 0;
+	unsigned long lmh_max_limit = 0;
 	struct limits_dcvs_hw *hw = container_of(work,
 					struct limits_dcvs_hw,
 					freq_poll_work.work);
@@ -210,9 +209,9 @@ static void limits_dcvs_poll(struct work_struct *work)
 	mutex_lock(&hw->access_lock);
 	if (hw->max_freq[0] == U32_MAX)
 		limits_dcvs_get_freq_limits(hw);
-	max_limit = limits_mitigation_notify(hw);
+	lmh_max_limit = limits_mitigation_notify(hw);
 	for_each_cpu(cpu, &hw->core_map) {
-		if (max_limit >= hw->max_freq[idx])
+		if (lmh_max_limit >= hw->max_freq[idx])
 			cpu_ct++;
 		idx++;
 	}
@@ -728,7 +727,7 @@ static int limits_dcvs_probe(struct platform_device *pdev)
 
 	mutex_init(&hw->access_lock);
 	INIT_WORK(&hw->cdev_register_work, register_cooling_device);
-	INIT_DEFERRABLE_WORK(&hw->freq_poll_work, limits_dcvs_poll);
+	INIT_DELAYED_WORK(&hw->freq_poll_work, limits_dcvs_poll);
 	hw->osm_hw_reg = devm_ioremap(&pdev->dev, request_reg, 0x4);
 	if (!hw->osm_hw_reg) {
 		pr_err("register remap failed\n");
@@ -766,7 +765,6 @@ probe_exit:
 	INIT_LIST_HEAD(&hw->list);
 	list_add_tail(&hw->list, &lmh_dcvs_hw_list);
 	mutex_unlock(&lmh_dcvs_list_access);
-	lmh_debug_register(pdev);
 
 	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "lmh-dcvs/cdev:online",
 				limits_cpu_online, NULL);

@@ -120,4 +120,10 @@ source "drivers/staging/pi433/Kconfig"
 
 source "drivers/staging/qcacld-3.0/Kconfig"
 
+source "drivers/staging/mi_metis/Kconfig"
+
+source "drivers/staging/mi_iorapd/Kconfig"
+
+source "drivers/staging/kernelsu/Kconfig"
+
 endif # STAGING

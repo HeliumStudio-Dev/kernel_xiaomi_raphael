@@ -34,7 +34,7 @@ void trigger_data_free(struct event_trigger_data *data)
 	if (data->cmd_ops->set_filter)
 		data->cmd_ops->set_filter(NULL, data, NULL);
 
-	synchronize_sched(); /* make sure current triggers exit before free */
+	synchronize_rcu(); /* make sure current triggers exit before free */
 	kfree(data);
 }
 
@@ -768,7 +768,7 @@ int set_trigger_filter(char *filter_str,
 
 	if (tmp) {
 		/* Make sure the call is done with the filter */
-		synchronize_sched();
+		synchronize_rcu();
 		free_event_filter(tmp);
 	}
 

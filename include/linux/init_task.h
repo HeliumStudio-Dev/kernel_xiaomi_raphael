@@ -104,6 +104,7 @@ extern struct cred init_cred;
 #ifdef CONFIG_TASKS_TRACE_RCU
 #define INIT_TASK_RCU_TRACE(tsk)					\
 	.trc_reader_nesting = 0,					\
+	.trc_reader_special.s = 0,					\
 	.trc_holdout_list =						\
 		LIST_HEAD_INIT(tsk.trc_holdout_list),
 #else

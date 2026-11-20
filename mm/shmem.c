@@ -83,6 +83,10 @@ static struct vfsmount *shm_mnt;
 
 #include "internal.h"
 
+#ifdef CONFIG_MEMFD_ASHMEM_SHIM
+#include "memfd-ashmem-shim.h"
+#endif
+
 #define BLOCKS_PER_PAGE  (PAGE_SIZE/512)
 #define VM_ACCT(size)    (PAGE_ALIGN(size) >> PAGE_SHIFT)
 
@@ -108,12 +112,14 @@ struct shmem_falloc {
 #ifdef CONFIG_TMPFS
 static unsigned long shmem_default_max_blocks(void)
 {
-	return totalram_pages / 2;
+	return totalram_pages() / 2;
 }
 
 static unsigned long shmem_default_max_inodes(void)
 {
-	return min(totalram_pages - totalhigh_pages, totalram_pages / 2);
+	unsigned long nr_pages = totalram_pages();
+
+	return min(nr_pages - totalhigh_pages(), nr_pages / 2);
 }
 #endif
 
@@ -585,7 +591,8 @@ static unsigned long shmem_unused_huge_shrink(struct shmem_sb_info *sbinfo,
  */
 static int shmem_add_to_page_cache(struct page *page,
 				   struct address_space *mapping,
-				   pgoff_t index, void *expected)
+				   pgoff_t index, void *expected, gfp_t gfp,
+				   struct mm_struct *charge_mm)
 {
 	int error, nr = hpage_nr_pages(page);
 
@@ -598,6 +605,19 @@ static int shmem_add_to_page_cache(struct page *page,
 	page_ref_add(page, nr);
 	page->mapping = mapping;
 	page->index = index;
+
+	if (!PageSwapCache(page)) {
+		error = mem_cgroup_charge(page, charge_mm, gfp, false);
+		if (error)
+			goto error;
+	}
+
+	if (!expected) {
+		error = radix_tree_maybe_preload_order(gfp & GFP_RECLAIM_MASK,
+						     compound_order(page));
+		if (error)
+			goto error;
+	}
 
 	spin_lock_irq(&mapping->tree_lock);
 	if (PageTransHuge(page)) {
@@ -631,14 +651,18 @@ static int shmem_add_to_page_cache(struct page *page,
 		mapping->nrpages += nr;
 		if (PageTransHuge(page))
 			__inc_node_page_state(page, NR_SHMEM_THPS);
-		__mod_node_page_state(page_pgdat(page), NR_FILE_PAGES, nr);
-		__mod_node_page_state(page_pgdat(page), NR_SHMEM, nr);
-		spin_unlock_irq(&mapping->tree_lock);
-	} else {
-		page->mapping = NULL;
-		spin_unlock_irq(&mapping->tree_lock);
-		page_ref_sub(page, nr);
+		__mod_lruvec_page_state(page, NR_FILE_PAGES, nr);
+		__mod_lruvec_page_state(page, NR_SHMEM, nr);
 	}
+	spin_unlock_irq(&mapping->tree_lock);
+	if (!expected)
+		radix_tree_preload_end();
+	if (error)
+		goto error;
+	return 0;
+error:
+	page->mapping = NULL;
+	page_ref_sub(page, nr);
 	return error;
 }
 
@@ -656,8 +680,8 @@ static void shmem_delete_from_page_cache(struct page *page, void *radswap)
 	error = shmem_radix_tree_replace(mapping, page->index, page, radswap);
 	page->mapping = NULL;
 	mapping->nrpages--;
-	__dec_node_page_state(page, NR_FILE_PAGES);
-	__dec_node_page_state(page, NR_SHMEM);
+	__dec_lruvec_page_state(page, NR_FILE_PAGES);
+	__dec_lruvec_page_state(page, NR_SHMEM);
 	spin_unlock_irq(&mapping->tree_lock);
 	put_page(page);
 	BUG_ON(error);
@@ -1135,7 +1159,8 @@ static unsigned long find_swap_entry(struct radix_tree_root *root, void *item)
  * If swap found in inode, free it and move page from swapcache to filecache.
  */
 static int shmem_unuse_inode(struct shmem_inode_info *info,
-			     swp_entry_t swap, struct page **pagep)
+			     swp_entry_t swap, struct page **pagep,
+			     struct mem_cgroup **memcgp)
 {
 	struct address_space *mapping = info->vfs_inode.i_mapping;
 	void *radswap;
@@ -1189,9 +1214,14 @@ static int shmem_unuse_inode(struct shmem_inode_info *info,
 	 * but also to hold up shmem_evict_inode(): so inode cannot be freed
 	 * beneath us (pagelock doesn't help until the page is in pagecache).
 	 */
-	if (!error)
+	if (!error) {
+		/* Consume the charge reserved before shmem_swaplist_mutex. */
+		(*pagep)->mapping = mapping;
+		mem_cgroup_commit_charge(*pagep, *memcgp, true, false);
+		*memcgp = NULL;
 		error = shmem_add_to_page_cache(*pagep, mapping, index,
-						radswap);
+						radswap, gfp, current->mm);
+	}
 	if (error != -ENOMEM) {
 		/*
 		 * Truncation and eviction use free_swap_and_cache(), which
@@ -1242,7 +1272,7 @@ int shmem_unuse(swp_entry_t swap, struct page *page)
 	list_for_each_safe(this, next, &shmem_swaplist) {
 		info = list_entry(this, struct shmem_inode_info, swaplist);
 		if (info->swapped)
-			error = shmem_unuse_inode(info, swap, &page);
+			error = shmem_unuse_inode(info, swap, &page, &memcg);
 		else
 			list_del_init(&info->swaplist);
 		cond_resched();
@@ -1256,8 +1286,7 @@ int shmem_unuse(swp_entry_t swap, struct page *page)
 		if (error != -ENOMEM)
 			error = 0;
 		mem_cgroup_cancel_charge(page, memcg, false);
-	} else
-		mem_cgroup_commit_charge(page, memcg, true, false);
+	}
 out:
 	unlock_page(page);
 	put_page(page);
@@ -1624,7 +1653,6 @@ static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
 	struct shmem_inode_info *info = SHMEM_I(inode);
 	struct shmem_sb_info *sbinfo;
 	struct mm_struct *charge_mm;
-	struct mem_cgroup *memcg;
 	struct page *page;
 	swp_entry_t swap;
 	enum sgp_type sgp_huge = sgp;
@@ -1721,11 +1749,10 @@ repeat:
 				goto failed;
 		}
 
-		error = mem_cgroup_try_charge(page, charge_mm, gfp, &memcg,
-				false);
-		if (!error) {
-			error = shmem_add_to_page_cache(page, mapping, index,
-						swp_to_radix_entry(swap));
+		error = shmem_add_to_page_cache(page, mapping, index,
+					      swp_to_radix_entry(swap), gfp,
+					      charge_mm);
+		if (error && error != -ENOMEM) {
 			/*
 			 * We already confirmed swap under page lock, and make
 			 * no memory allocation here, so usually no possibility
@@ -1738,15 +1765,10 @@ repeat:
 			 * Reset swap.val? No, leave it so "failed" goes back to
 			 * "repeat": reading a hole and writing should succeed.
 			 */
-			if (error) {
-				mem_cgroup_cancel_charge(page, memcg, false);
-				delete_from_swap_cache(page);
-			}
+			delete_from_swap_cache(page);
 		}
 		if (error)
 			goto failed;
-
-		mem_cgroup_commit_charge(page, memcg, true, false);
 
 		spin_lock_irq(&info->lock);
 		info->swapped--;
@@ -1827,24 +1849,10 @@ alloc_nohuge:		page = shmem_alloc_and_acct_page(gfp, inode,
 		if (sgp == SGP_WRITE)
 			__SetPageReferenced(page);
 
-		error = mem_cgroup_try_charge(page, charge_mm, gfp, &memcg,
-				PageTransHuge(page));
+		error = shmem_add_to_page_cache(page, mapping, hindex, NULL,
+					      gfp, charge_mm);
 		if (error)
 			goto unacct;
-		error = radix_tree_maybe_preload_order(gfp & GFP_RECLAIM_MASK,
-				compound_order(page));
-		if (!error) {
-			error = shmem_add_to_page_cache(page, mapping, hindex,
-							NULL);
-			radix_tree_preload_end();
-		}
-		if (error) {
-			mem_cgroup_cancel_charge(page, memcg,
-					PageTransHuge(page));
-			goto unacct;
-		}
-		mem_cgroup_commit_charge(page, memcg, false,
-				PageTransHuge(page));
 		lru_cache_add_anon(page);
 
 		spin_lock_irq(&info->lock);
@@ -2283,7 +2291,6 @@ int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
 	struct address_space *mapping = inode->i_mapping;
 	gfp_t gfp = mapping_gfp_mask(mapping);
 	pgoff_t pgoff = linear_page_index(dst_vma, dst_addr);
-	struct mem_cgroup *memcg;
 	void *page_kaddr;
 	struct page *page;
 	int ret;
@@ -2341,19 +2348,9 @@ int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
 	if (unlikely(pgoff >= max_off))
 		goto out_release;
 
-	ret = mem_cgroup_try_charge(page, dst_mm, gfp, &memcg, false);
+	ret = shmem_add_to_page_cache(page, mapping, pgoff, NULL, gfp, dst_mm);
 	if (ret)
 		goto out_release;
-
-	ret = radix_tree_maybe_preload(gfp & GFP_RECLAIM_MASK);
-	if (!ret) {
-		ret = shmem_add_to_page_cache(page, mapping, pgoff, NULL);
-		radix_tree_preload_end();
-	}
-	if (ret)
-		goto out_release_uncharge;
-
-	mem_cgroup_commit_charge(page, memcg, false, false);
 
 	ret = mfill_atomic_install_pte(dst_mm, dst_pmd, dst_vma, dst_addr,
 				       page, true, false);
@@ -2371,8 +2368,6 @@ int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
 	return 0;
 out_delete_from_cache:
 	delete_from_page_cache(page);
-out_release_uncharge:
-	mem_cgroup_cancel_charge(page, memcg, false);
 out_release:
 	unlock_page(page);
 	put_page(page);
@@ -3552,7 +3547,7 @@ static int shmem_parse_options(char *options, struct shmem_sb_info *sbinfo,
 			size = memparse(value,&rest);
 			if (*rest == '%') {
 				size <<= PAGE_SHIFT;
-				size *= totalram_pages;
+				size *= totalram_pages();
 				do_div(size, 100);
 				rest++;
 			}
@@ -3948,6 +3943,12 @@ static const struct file_operations shmem_file_operations = {
 	.splice_read	= generic_file_splice_read,
 	.splice_write	= iter_file_splice_write,
 	.fallocate	= shmem_fallocate,
+#endif
+#ifdef CONFIG_MEMFD_ASHMEM_SHIM
+	.unlocked_ioctl	= memfd_ashmem_shim_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= memfd_ashmem_shim_compat_ioctl,
+#endif
 #endif
 };
 

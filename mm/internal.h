@@ -13,6 +13,7 @@
 
 #include <linux/fs.h>
 #include <linux/mm.h>
+#include <linux/mmu_notifier.h>
 #include <linux/pagemap.h>
 #include <linux/tracepoint-defs.h>
 
@@ -38,12 +39,121 @@
 
 void page_writeback_init(void);
 
+#ifdef CONFIG_MMU
+
+/* Flags for page_pte_batch_flags(). */
+typedef int __bitwise ppb_t;
+
+/* Compare PTEs respecting the dirty bit. */
+#define PPB_RESPECT_DIRTY		((__force ppb_t)BIT(0))
+
+/* Compare PTEs respecting the soft-dirty bit. */
+#define PPB_RESPECT_SOFT_DIRTY		((__force ppb_t)BIT(1))
+
+/* Merge the batch's young and dirty bits into the PTE copy at @ptentp. */
+#define PPB_MERGE_YOUNG_DIRTY		((__force ppb_t)BIT(3))
+
+static inline pte_t __pte_batch_clear_ignored(pte_t pte, ppb_t flags)
+{
+	if (!(flags & PPB_RESPECT_DIRTY))
+		pte = pte_mkclean(pte);
+	if (likely(!(flags & PPB_RESPECT_SOFT_DIRTY)))
+		pte = pte_clear_soft_dirty(pte);
+	return pte_wrprotect(pte_mkold(pte));
+}
+
+/**
+ * page_pte_batch_flags - detect a PTE batch for a compound page
+ * @page: The compound page to detect a PTE batch for.
+ * @ptep: Page table pointer for the first entry.
+ * @ptentp: Pointer to a COPY of the first page table entry.
+ * @max_nr: The maximum number of table entries to consider.
+ * @flags: Flags to modify the PTE batch semantics.
+ *
+ * Detect a PTE batch: consecutive (present) PTEs that map consecutive
+ * pages of the same compound page.
+ *
+ * All PTEs inside a PTE batch have the same PTE bits set, excluding the PFN,
+ * the accessed bit, writable bit, dirty bit (unless PPB_RESPECT_DIRTY is set) and
+ * soft-dirty bit (unless PPB_RESPECT_SOFT_DIRTY is set).
+ *
+ * @ptep must map a subpage of the compound page. max_nr must be at least one
+ * and must be limited by the caller to a single VMA and a single page table.
+ *
+ * PPB_MERGE_YOUNG_DIRTY updates only the PTE copy at @ptentp.
+ * The caller must hold the page table lock.
+ *
+ * Return: the number of table entries in the batch.
+ */
+static inline unsigned int page_pte_batch_flags(struct page *page,
+		pte_t *ptep, pte_t *ptentp, unsigned int max_nr, ppb_t flags)
+{
+	bool any_young = false, any_dirty = false;
+	pte_t expected_pte, pte = *ptentp;
+	unsigned int nr, cur_nr;
+
+	VM_WARN_ON_ONCE_PAGE(!pte_present(pte), page);
+	VM_WARN_ON_ONCE_PAGE(!PageTransCompound(page) || max_nr < 1, page);
+	VM_WARN_ON_ONCE_PAGE(compound_head(pfn_to_page(pte_pfn(pte))) != page, page);
+	VM_WARN_ON_ONCE(ptentp == ptep);
+
+	/* Stay within the compound page, even when the next PFN is contiguous. */
+	max_nr = min_t(unsigned long, max_nr,
+		       page_to_pfn(page) + hpage_nr_pages(page) - pte_pfn(pte));
+
+	nr = pte_batch_hint(ptep, pte);
+	expected_pte = __pte_batch_clear_ignored(pte_advance_pfn(pte, nr), flags);
+	ptep += nr;
+
+	while (nr < max_nr) {
+		pte = READ_ONCE(*ptep);
+		if (!pte_same(__pte_batch_clear_ignored(pte, flags), expected_pte))
+			break;
+
+		if (flags & PPB_MERGE_YOUNG_DIRTY) {
+			any_young |= pte_young(pte);
+			any_dirty |= pte_dirty(pte);
+		}
+
+		cur_nr = pte_batch_hint(ptep, pte);
+		expected_pte = pte_advance_pfn(expected_pte, cur_nr);
+		ptep += cur_nr;
+		nr += cur_nr;
+	}
+
+	if (any_young)
+		*ptentp = pte_mkyoung(*ptentp);
+	if (any_dirty)
+		*ptentp = pte_mkdirty(*ptentp);
+
+	return min(nr, max_nr);
+}
+
+static inline unsigned int page_pte_batch(struct page *page, pte_t *ptep,
+		pte_t pte, unsigned int max_nr)
+{
+	return page_pte_batch_flags(page, ptep, &pte, max_nr, 0);
+}
+
+#endif /* CONFIG_MMU */
+
+void __acct_reclaim_writeback(pg_data_t *pgdat, struct page *page,
+						int nr_throttled);
+static inline void acct_reclaim_writeback(struct page *page)
+{
+	pg_data_t *pgdat = page_pgdat(page);
+	int nr_throttled = atomic_read(&pgdat->nr_writeback_throttled);
+
+	if (nr_throttled)
+		__acct_reclaim_writeback(pgdat, page, nr_throttled);
+}
+
 int do_swap_page(struct vm_fault *vmf);
 
 void free_pgtables(struct mmu_gather *tlb, struct vm_area_struct *start_vma,
 		unsigned long floor, unsigned long ceiling);
 
-static inline bool can_madv_dontneed_vma(struct vm_area_struct *vma)
+static inline bool can_madv_lru_vma(struct vm_area_struct *vma)
 {
 	return !(vma->vm_flags & (VM_LOCKED|VM_HUGETLB|VM_PFNMAP));
 }
@@ -167,6 +277,7 @@ extern void prep_compound_page(struct page *page, unsigned int order);
 extern void post_alloc_hook(struct page *page, unsigned int order,
 					gfp_t gfp_flags);
 extern int user_min_free_kbytes;
+extern atomic_long_t kswapd_waiters;
 
 #if defined CONFIG_COMPACTION || defined CONFIG_CMA
 
@@ -581,4 +692,18 @@ static inline bool lmk_kill_possible(void)
 	return false;
 }
 #endif
+#ifdef CONFIG_MMU
+static inline int test_and_clear_young_ptes_notify(struct vm_area_struct *vma,
+		unsigned long addr, pte_t *ptep, unsigned int nr)
+{
+	int young = test_and_clear_young_ptes(vma, addr, ptep, nr);
+
+#ifdef CONFIG_MMU_NOTIFIER
+	young |= mmu_notifier_clear_young(vma->vm_mm, addr, addr + nr * PAGE_SIZE);
+#endif
+	return young;
+}
+
+#endif /* CONFIG_MMU */
+
 #endif	/* __MM_INTERNAL_H */

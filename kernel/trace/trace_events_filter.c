@@ -1858,10 +1858,10 @@ static int replace_system_preds(struct trace_subsystem_dir *dir,
 
 	/*
 	 * The calls can still be using the old filters.
-	 * Do a synchronize_sched() to ensure all calls are
+	 * Do a synchronize_rcu() to ensure all calls are
 	 * done with them before we free them.
 	 */
-	synchronize_sched();
+	synchronize_rcu();
 	list_for_each_entry_safe(filter_item, tmp, &filter_list, list) {
 		__free_filter(filter_item->filter);
 		list_del(&filter_item->list);
@@ -1879,7 +1879,7 @@ static int replace_system_preds(struct trace_subsystem_dir *dir,
  fail_mem:
 	/* If any call succeeded, we still need to sync */
 	if (!fail)
-		synchronize_sched();
+		synchronize_rcu();
 	list_for_each_entry_safe(filter_item, tmp, &filter_list, list) {
 		__free_filter(filter_item->filter);
 		list_del(&filter_item->list);
@@ -2029,7 +2029,7 @@ int apply_event_filter(struct trace_event_file *file, char *filter_string)
 		event_clear_filter(file);
 
 		/* Make sure the filter is not being used */
-		synchronize_sched();
+		synchronize_rcu();
 		__free_filter(filter);
 
 		return 0;
@@ -2056,7 +2056,7 @@ int apply_event_filter(struct trace_event_file *file, char *filter_string)
 
 		if (tmp) {
 			/* Make sure the call is done with the filter */
-			synchronize_sched();
+			synchronize_rcu();
 			__free_filter(tmp);
 		}
 	}
@@ -2086,7 +2086,7 @@ int apply_subsystem_event_filter(struct trace_subsystem_dir *dir,
 		filter = system->filter;
 		system->filter = NULL;
 		/* Ensure all filters are no longer used */
-		synchronize_sched();
+		synchronize_rcu();
 		filter_free_subsystem_filters(dir, tr);
 		__free_filter(filter);
 		goto out_unlock;
@@ -2096,7 +2096,7 @@ int apply_subsystem_event_filter(struct trace_subsystem_dir *dir,
 	if (filter) {
 		/*
 		 * No event actually uses the system filter
-		 * we can free it without synchronize_sched().
+		 * we can free it without synchronize_rcu().
 		 */
 		__free_filter(system->filter);
 		system->filter = filter;

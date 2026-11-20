@@ -22,6 +22,7 @@
 #include <linux/swap.h>
 #include <linux/mman.h>
 #include <linux/pagemap.h>
+#include <linux/mm_inline.h>
 #include <linux/file.h>
 #include <linux/uio.h>
 #include <linux/hash.h>
@@ -239,9 +240,9 @@ void __delete_from_page_cache(struct page *page, void *shadow)
 	if (PageHuge(page))
 		return;
 
-	__mod_node_page_state(page_pgdat(page), NR_FILE_PAGES, -nr);
+	__mod_lruvec_page_state(page, NR_FILE_PAGES, -nr);
 	if (PageSwapBacked(page)) {
-		__mod_node_page_state(page_pgdat(page), NR_SHMEM, -nr);
+		__mod_lruvec_page_state(page, NR_SHMEM, -nr);
 		if (PageTransHuge(page))
 			__dec_node_page_state(page, NR_SHMEM_THPS);
 	} else {
@@ -728,6 +729,8 @@ int replace_page_cache_page(struct page *old, struct page *new, gfp_t gfp_mask)
 		new->mapping = mapping;
 		new->index = offset;
 
+		mem_cgroup_migrate(old, new);
+
 		spin_lock_irqsave(&mapping->tree_lock, flags);
 		__delete_from_page_cache(old, NULL);
 		error = page_cache_tree_insert(mapping, new, NULL);
@@ -737,11 +740,10 @@ int replace_page_cache_page(struct page *old, struct page *new, gfp_t gfp_mask)
 		 * hugetlb pages do not participate in page cache accounting.
 		 */
 		if (!PageHuge(new))
-			__inc_node_page_state(new, NR_FILE_PAGES);
+			__inc_lruvec_page_state(new, NR_FILE_PAGES);
 		if (PageSwapBacked(new))
-			__inc_node_page_state(new, NR_SHMEM);
+			__inc_lruvec_page_state(new, NR_SHMEM);
 		spin_unlock_irqrestore(&mapping->tree_lock, flags);
-		mem_cgroup_migrate(old, new);
 		radix_tree_preload_end();
 		if (freepage)
 			freepage(old);
@@ -758,29 +760,24 @@ static int __add_to_page_cache_locked(struct page *page,
 				      void **shadowp)
 {
 	int huge = PageHuge(page);
-	struct mem_cgroup *memcg;
 	int error;
 
 	VM_BUG_ON_PAGE(!PageLocked(page), page);
 	VM_BUG_ON_PAGE(PageSwapBacked(page), page);
 
-	if (!huge) {
-		error = mem_cgroup_try_charge(page, current->mm,
-					      gfp_mask, &memcg, false);
-		if (error)
-			return error;
-	}
-
-	error = radix_tree_maybe_preload(gfp_mask & GFP_RECLAIM_MASK);
-	if (error) {
-		if (!huge)
-			mem_cgroup_cancel_charge(page, memcg, false);
-		return error;
-	}
-
 	get_page(page);
 	page->mapping = mapping;
 	page->index = offset;
+
+	if (!huge) {
+		error = mem_cgroup_charge(page, current->mm, gfp_mask, false);
+		if (error)
+			goto error;
+	}
+
+	error = radix_tree_maybe_preload(gfp_mask & GFP_RECLAIM_MASK);
+	if (error)
+		goto error;
 
 	spin_lock_irq(&mapping->tree_lock);
 	error = page_cache_tree_insert(mapping, page, shadowp);
@@ -790,18 +787,15 @@ static int __add_to_page_cache_locked(struct page *page,
 
 	/* hugetlb pages do not participate in page cache accounting. */
 	if (!huge)
-		__inc_node_page_state(page, NR_FILE_PAGES);
+		__inc_lruvec_page_state(page, NR_FILE_PAGES);
 	spin_unlock_irq(&mapping->tree_lock);
-	if (!huge)
-		mem_cgroup_commit_charge(page, memcg, false, false);
 	trace_mm_filemap_add_to_page_cache(page);
 	return 0;
 err_insert:
+	spin_unlock_irq(&mapping->tree_lock);
+error:
 	page->mapping = NULL;
 	/* Leave page->index set: truncation relies upon it */
-	spin_unlock_irq(&mapping->tree_lock);
-	if (!huge)
-		mem_cgroup_cancel_charge(page, memcg, false);
 	put_page(page);
 	return error;
 }
@@ -1166,6 +1160,8 @@ void end_page_writeback(struct page *page)
 		ClearPageReclaim(page);
 		rotate_reclaimable_page(page);
 	}
+
+	acct_reclaim_writeback(page);
 
 	if (!test_clear_page_writeback(page))
 		BUG();
@@ -2685,7 +2681,7 @@ repeat:
 				vmf->flags |= FAULT_FLAG_PREFAULT_OLD;
 		}
 
-		if (alloc_set_pte(vmf, NULL, page))
+		if (alloc_set_pte(vmf, page))
 			goto unlock;
 		unlock_page(page);
 		goto next;

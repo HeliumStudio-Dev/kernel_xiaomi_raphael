@@ -192,7 +192,7 @@ static int expand_fdtable(struct files_struct *files, unsigned int nr)
 	 * or have finished their rcu_read_lock_sched() section.
 	 */
 	if (atomic_read(&files->count) > 1)
-		synchronize_sched();
+		synchronize_rcu();
 
 	spin_lock(&files->file_lock);
 	if (IS_ERR(new_fdt))
@@ -413,7 +413,7 @@ static struct fdtable *close_files(struct files_struct * files)
 				struct file * file = xchg(&fdt->fd[i], NULL);
 				if (file) {
 					filp_close(file, files);
-					cond_resched_tasks_rcu_qs();
+					cond_resched();
 				}
 			}
 			i++;
@@ -794,6 +794,37 @@ int __close_range(unsigned fd, unsigned max_fd, unsigned int flags)
 	}
 
 	return 0;
+}
+
+/*
+ * variant of __close_fd that gets a ref on the file for later fput.
+ * The caller must ensure that filp_close() called on the file, and then
+ * an fput().
+ */
+int close_fd_get_file(unsigned int fd, struct file **res)
+{
+	struct files_struct *files = current->files;
+	struct file *file;
+	struct fdtable *fdt;
+
+	spin_lock(&files->file_lock);
+	fdt = files_fdtable(files);
+	if (fd >= fdt->max_fds)
+		goto out_unlock;
+	file = fdt->fd[fd];
+	if (!file)
+		goto out_unlock;
+	rcu_assign_pointer(fdt->fd[fd], NULL);
+	__put_unused_fd(files, fd);
+	spin_unlock(&files->file_lock);
+	get_file(file);
+	*res = file;
+	return 0;
+
+out_unlock:
+	spin_unlock(&files->file_lock);
+	*res = NULL;
+	return -ENOENT;
 }
 
 void do_close_on_exec(struct files_struct *files)

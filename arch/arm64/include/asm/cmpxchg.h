@@ -18,9 +18,9 @@
 #ifndef __ASM_CMPXCHG_H
 #define __ASM_CMPXCHG_H
 
-#include <linux/bug.h>
+#include <linux/build_bug.h>
+#include <linux/compiler.h>
 
-#include <asm/atomic.h>
 #include <asm/barrier.h>
 #include <asm/lse.h>
 
@@ -36,16 +36,9 @@ static inline u##sz __xchg_case_##name##sz(u##sz x, volatile void *ptr)		\
 	unsigned long tmp;							\
 										\
 	asm volatile(ARM64_LSE_ATOMIC_INSN(					\
-	/* LL/SC */								\
-	"	prfm	pstl1strm, %2\n"					\
-	"1:	ld" #acq "xr" #sfx "\t%" #w "0, %2\n"				\
-	"	st" #rel "xr" #sfx "\t%w1, %" #w "3, %2\n"			\
-	"	cbnz	%w1, 1b\n"						\
-	"	" #mb,								\
 	/* LSE atomics */							\
-	"	swp" #acq_lse #rel #sfx "\t%" #w "3, %" #w "0, %2\n"		\
-		__nops(3)							\
-	"	" #nop_lse)							\
+	"	prfm	pstl1strm, %2\n"					\
+	"	swp" #acq_lse #rel #sfx "\t%" #w "3, %" #w "0, %2\n")		\
 	: "=&r" (ret), "=&r" (tmp), "+Q" (*(u##sz *)ptr)			\
 	: "r" (x)								\
 	: cl);									\
@@ -114,6 +107,50 @@ __XCHG_GEN(_mb)
 #define xchg_release(...)	__xchg_wrapper(_rel, __VA_ARGS__)
 #define xchg(...)		__xchg_wrapper( _mb, __VA_ARGS__)
 
+#define __CMPXCHG_CASE(name, sz)			\
+static inline u##sz __cmpxchg_case_##name##sz(volatile void *ptr,	\
+					      u##sz old,		\
+					      u##sz new)		\
+{									\
+	return __lse_ll_sc_body(_cmpxchg_case_##name##sz,		\
+				ptr, old, new);				\
+}
+
+__CMPXCHG_CASE(    ,  8)
+__CMPXCHG_CASE(    , 16)
+__CMPXCHG_CASE(    , 32)
+__CMPXCHG_CASE(    , 64)
+__CMPXCHG_CASE(acq_,  8)
+__CMPXCHG_CASE(acq_, 16)
+__CMPXCHG_CASE(acq_, 32)
+__CMPXCHG_CASE(acq_, 64)
+__CMPXCHG_CASE(rel_,  8)
+__CMPXCHG_CASE(rel_, 16)
+__CMPXCHG_CASE(rel_, 32)
+__CMPXCHG_CASE(rel_, 64)
+__CMPXCHG_CASE(mb_,  8)
+__CMPXCHG_CASE(mb_, 16)
+__CMPXCHG_CASE(mb_, 32)
+__CMPXCHG_CASE(mb_, 64)
+
+#undef __CMPXCHG_CASE
+
+#define __CMPXCHG_DBL(name)						\
+static inline long __cmpxchg_double##name(unsigned long old1,		\
+					 unsigned long old2,		\
+					 unsigned long new1,		\
+					 unsigned long new2,		\
+					 volatile void *ptr)		\
+{									\
+	return __lse_ll_sc_body(_cmpxchg_double##name, 			\
+				old1, old2, new1, new2, ptr);		\
+}
+
+__CMPXCHG_DBL(   )
+__CMPXCHG_DBL(_mb)
+
+#undef __CMPXCHG_DBL
+
 #define __CMPXCHG_GEN(sfx)						\
 static __always_inline unsigned long __cmpxchg##sfx(volatile void *ptr,	\
 					   unsigned long old,		\
@@ -122,9 +159,9 @@ static __always_inline unsigned long __cmpxchg##sfx(volatile void *ptr,	\
 {									\
 	switch (size) {							\
 	case 1:								\
-		return __cmpxchg_case##sfx##_8(ptr, (u8)old, new);	\
+		return __cmpxchg_case##sfx##_8(ptr, old, new);		\
 	case 2:								\
-		return __cmpxchg_case##sfx##_16(ptr, (u16)old, new);	\
+		return __cmpxchg_case##sfx##_16(ptr, old, new);		\
 	case 4:								\
 		return __cmpxchg_case##sfx##_32(ptr, old, new);		\
 	case 8:								\
@@ -196,32 +233,6 @@ __CMPXCHG_GEN(_mb)
 	__ret; \
 })
 
-/* this_cpu_cmpxchg */
-#define _protect_cmpxchg_local(pcp, o, n)			\
-({								\
-	typeof(*raw_cpu_ptr(&(pcp))) __ret;			\
-	preempt_disable();					\
-	__ret = cmpxchg_local(raw_cpu_ptr(&(pcp)), o, n);	\
-	preempt_enable();					\
-	__ret;							\
-})
-
-#define this_cpu_cmpxchg_1(ptr, o, n) _protect_cmpxchg_local(ptr, o, n)
-#define this_cpu_cmpxchg_2(ptr, o, n) _protect_cmpxchg_local(ptr, o, n)
-#define this_cpu_cmpxchg_4(ptr, o, n) _protect_cmpxchg_local(ptr, o, n)
-#define this_cpu_cmpxchg_8(ptr, o, n) _protect_cmpxchg_local(ptr, o, n)
-
-#define this_cpu_cmpxchg_double_8(ptr1, ptr2, o1, o2, n1, n2)		\
-({									\
-	int __ret;							\
-	preempt_disable();						\
-	__ret = cmpxchg_double_local(	raw_cpu_ptr(&(ptr1)),		\
-					raw_cpu_ptr(&(ptr2)),		\
-					o1, o2, n1, n2);		\
-	preempt_enable();						\
-	__ret;								\
-})
-
 #define __CMPWAIT_CASE(w, sfx, sz)					\
 static inline void __cmpwait_case_##sz(volatile void *ptr,		\
 				       unsigned long val)		\
@@ -236,7 +247,7 @@ static inline void __cmpwait_case_##sz(volatile void *ptr,		\
 	"	cbnz	%" #w "[tmp], 1f\n"				\
 	"	wfe\n"							\
 	"1:"								\
-	: [tmp] "=&r" (tmp), [v] "+Q" (*(unsigned long *)ptr)		\
+	: [tmp] "=&r" (tmp), [v] "+Q" (*(u##sz *)ptr)			\
 	: [val] "r" (val));						\
 }
 

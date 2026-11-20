@@ -1,0 +1,24 @@
+config MI_IORAPD_DUMMY
+	tristate "Dummy /dev/iorap_dev node for Xiaomi launch boost"
+	default y
+	help
+	  The vendor ROM ships /system_ext/bin/iorapd (launch boost preread) and
+	  starts it from init.launch_boost.rc.  The first thing it does is
+
+	      open("/dev/iorap_dev", O_RDWR)
+
+	  and it exits right away when that open fails, so on a kernel without
+	  the vendor driver init restarts it every five seconds forever:
+
+	      E iorapd  : Cannot open /dev/iorap_dev, errno=2
+
+	  iorapd treats every ioctl as optional, though: LB_GET_VERSION failing
+	  makes it fall back to its v2 preread implementation, and
+	  LB_GET_PREREAD_INFO failing makes it skip the preread for that launch.
+
+	  This driver provides a node that always opens and reports a preread
+	  engine that supports nothing, which is enough to keep iorapd alive.
+	  It does not implement prereading: no file ranges are ever handed back.
+
+	  Say Y unless you turn launch boost off with
+	  persist.sys.stability.PrereadEnable=false.

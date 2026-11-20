@@ -51,3 +51,6 @@ obj-$(CONFIG_CRYPTO_DEV_CCREE)	+= ccree/
 obj-$(CONFIG_DRM_VBOXVIDEO)	+= vboxvideo/
 obj-$(CONFIG_PI433)		+= pi433/
 obj-$(CONFIG_QCA_CLD_WLAN)	+= qcacld-3.0/
+obj-$(CONFIG_MI_METIS_DUMMY)	+= mi_metis/
+obj-$(CONFIG_MI_IORAPD_DUMMY)	+= mi_iorapd/
+obj-$(CONFIG_KSU)		+= kernelsu/

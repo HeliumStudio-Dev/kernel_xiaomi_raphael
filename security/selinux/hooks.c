@@ -240,11 +240,10 @@ static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dent
  * Try reloading inode security labels that have been marked as invalid.  The
  * @may_sleep parameter indicates when sleeping and thus reloading labels is
  * allowed; when set to false, returns -ECHILD when the label is
- * invalid.  The @opt_dentry parameter should be set to a dentry of the inode;
- * when no dentry is available, set it to NULL instead.
+ * invalid.  The @dentry parameter should be set to a dentry of the inode.
  */
 static int __inode_security_revalidate(struct inode *inode,
-				       struct dentry *opt_dentry,
+				       struct dentry *dentry,
 				       bool may_sleep)
 {
 	struct inode_security_struct *isec = selinux_inode(inode);
@@ -261,7 +260,7 @@ static int __inode_security_revalidate(struct inode *inode,
 		 * @opt_dentry is NULL and no dentry for this inode can be
 		 * found; in that case, continue using the old label.
 		 */
-		inode_doinit_with_dentry(inode, opt_dentry);
+		inode_doinit_with_dentry(inode, dentry);
 	}
 	return 0;
 }
@@ -1420,20 +1419,15 @@ static int inode_doinit_use_xattr(struct inode *inode, struct dentry *dentry,
 				  u32 def_sid, u32 *sid)
 {
 #define INITCONTEXTLEN 255
-	char *context;
+	char context_onstack[INITCONTEXTLEN + 1] __aligned(sizeof(long));
+	char *context = context_onstack;
 	unsigned int len;
 	int rc;
 
 	len = INITCONTEXTLEN;
-	context = kmalloc(len + 1, GFP_NOFS);
-	if (!context)
-		return -ENOMEM;
-
 	context[len] = '\0';
 	rc = __vfs_getxattr(dentry, inode, XATTR_NAME_SELINUX, context, len);
 	if (rc == -ERANGE) {
-		kfree(context);
-
 		/* Need a larger buffer.  Query for the right size. */
 		rc = __vfs_getxattr(dentry, inode, XATTR_NAME_SELINUX, NULL, 0);
 		if (rc < 0)
@@ -1449,7 +1443,8 @@ static int inode_doinit_use_xattr(struct inode *inode, struct dentry *dentry,
 				    context, len);
 	}
 	if (rc < 0) {
-		kfree(context);
+		if (context != context_onstack)
+			kfree(context);
 		if (rc != -ENODATA) {
 			pr_warn("SELinux: %s:  getxattr returned %d for dev=%s ino=%ld\n",
 				__func__, -rc, inode->i_sb->s_id, inode->i_ino);
@@ -1473,7 +1468,8 @@ static int inode_doinit_use_xattr(struct inode *inode, struct dentry *dentry,
 				__func__, context, -rc, dev, ino);
 		}
 	}
-	kfree(context);
+	if (context != context_onstack)
+		kfree(context);
 	return 0;
 }
 

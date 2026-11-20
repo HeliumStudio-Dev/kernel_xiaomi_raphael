@@ -606,7 +606,9 @@ static int __collapse_huge_page_isolate(struct vm_area_struct *vma,
 
 		/* There should be enough young pte to collapse the page */
 		if (pte_young(pteval) ||
-		    page_is_young(page) || PageReferenced(page) ||
+		    page_is_young(page) ||
+		    (lru_gen_enabled() ? page_lru_refs(compound_head(page)) :
+					PageReferenced(page)) ||
 		    mmu_notifier_test_young(vma->vm_mm, address))
 			referenced++;
 	}
@@ -969,7 +971,6 @@ static void collapse_huge_page(struct mm_struct *mm,
 	struct page *new_page;
 	spinlock_t *pmd_ptl, *pte_ptl;
 	int isolated = 0, result = 0;
-	struct mem_cgroup *memcg;
 	struct vm_area_struct *vma;
 	unsigned long mmun_start;	/* For mmu_notifiers */
 	unsigned long mmun_end;		/* For mmu_notifiers */
@@ -994,8 +995,8 @@ static void collapse_huge_page(struct mm_struct *mm,
 	}
 
 	/* Do not oom kill for khugepaged charges */
-	if (unlikely(mem_cgroup_try_charge(new_page, mm, gfp | __GFP_NORETRY,
-					   &memcg, true))) {
+	if (unlikely(mem_cgroup_charge(new_page, mm, gfp | __GFP_NORETRY,
+				       false))) {
 		result = SCAN_CGROUP_CHARGE_FAIL;
 		goto out_nolock;
 	}
@@ -1003,7 +1004,6 @@ static void collapse_huge_page(struct mm_struct *mm,
 	down_read(&mm->mmap_sem);
 	result = hugepage_vma_revalidate(mm, address, &vma);
 	if (result) {
-		mem_cgroup_cancel_charge(new_page, memcg, true);
 		up_read(&mm->mmap_sem);
 		goto out_nolock;
 	}
@@ -1011,7 +1011,6 @@ static void collapse_huge_page(struct mm_struct *mm,
 	pmd = mm_find_pmd(mm, address);
 	if (!pmd) {
 		result = SCAN_PMD_NULL;
-		mem_cgroup_cancel_charge(new_page, memcg, true);
 		up_read(&mm->mmap_sem);
 		goto out_nolock;
 	}
@@ -1022,7 +1021,6 @@ static void collapse_huge_page(struct mm_struct *mm,
 	 * Continuing to collapse causes inconsistency.
 	 */
 	if (!__collapse_huge_page_swapin(mm, vma, address, pmd, referenced)) {
-		mem_cgroup_cancel_charge(new_page, memcg, true);
 		up_read(&mm->mmap_sem);
 		goto out_nolock;
 	}
@@ -1105,7 +1103,6 @@ static void collapse_huge_page(struct mm_struct *mm,
 	spin_lock(pmd_ptl);
 	BUG_ON(!pmd_none(*pmd));
 	page_add_new_anon_rmap(new_page, vma, address, true);
-	mem_cgroup_commit_charge(new_page, memcg, false, true);
 	lru_cache_add_active_or_unevictable(new_page, vma);
 	pgtable_trans_huge_deposit(mm, pmd, pgtable);
 	set_pmd_at(mm, address, pmd, _pmd);
@@ -1119,10 +1116,11 @@ static void collapse_huge_page(struct mm_struct *mm,
 out_up_write:
 	up_write(&mm->mmap_sem);
 out_nolock:
+	if (!IS_ERR_OR_NULL(*hpage))
+		mem_cgroup_uncharge(*hpage);
 	trace_mm_collapse_huge_page(mm, isolated, result);
 	return;
 out:
-	mem_cgroup_cancel_charge(new_page, memcg, true);
 	goto out_up_write;
 }
 
@@ -1224,7 +1222,9 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
 			goto out_unmap;
 		}
 		if (pte_young(pteval) ||
-		    page_is_young(page) || PageReferenced(page) ||
+		    page_is_young(page) ||
+		    (lru_gen_enabled() ? page_lru_refs(compound_head(page)) :
+					PageReferenced(page)) ||
 		    mmu_notifier_test_young(vma->vm_mm, address))
 			referenced++;
 	}
@@ -1314,7 +1314,6 @@ static void retract_page_tables(struct address_space *mapping, pgoff_t pgoff)
 				_pmd = pmdp_collapse_flush(vma, addr, pmd);
 				spin_unlock(ptl);
 				mm_dec_nr_ptes(vma->vm_mm);
-				atomic_long_dec(&mm->nr_ptes);
 				tlb_remove_table_sync_one();
 				pte_free(mm, pmd_pgtable(_pmd));
 				mmu_notifier_invalidate_range_end(mm, addr,
@@ -1350,7 +1349,6 @@ static void collapse_shmem(struct mm_struct *mm,
 {
 	gfp_t gfp;
 	struct page *page, *new_page, *tmp;
-	struct mem_cgroup *memcg;
 	pgoff_t index, end = start + HPAGE_PMD_NR;
 	LIST_HEAD(pagelist);
 	struct radix_tree_iter iter;
@@ -1369,8 +1367,8 @@ static void collapse_shmem(struct mm_struct *mm,
 	}
 
 	/* Do not oom kill for khugepaged charges */
-	if (unlikely(mem_cgroup_try_charge(new_page, mm, gfp | __GFP_NORETRY,
-					   &memcg, true))) {
+	if (unlikely(mem_cgroup_charge(new_page, mm, gfp | __GFP_NORETRY,
+				       false))) {
 		result = SCAN_CGROUP_CHARGE_FAIL;
 		goto out;
 	}
@@ -1532,10 +1530,8 @@ out_unlock:
 
 	__inc_node_page_state(new_page, NR_SHMEM_THPS);
 	if (nr_none) {
-		struct zone *zone = page_zone(new_page);
-
-		__mod_node_page_state(zone->zone_pgdat, NR_FILE_PAGES, nr_none);
-		__mod_node_page_state(zone->zone_pgdat, NR_SHMEM, nr_none);
+		__mod_lruvec_page_state(new_page, NR_FILE_PAGES, nr_none);
+		__mod_lruvec_page_state(new_page, NR_SHMEM, nr_none);
 	}
 
 tree_locked:
@@ -1572,7 +1568,6 @@ tree_unlocked:
 		SetPageUptodate(new_page);
 		page_ref_add(new_page, HPAGE_PMD_NR - 1);
 		set_page_dirty(new_page);
-		mem_cgroup_commit_charge(new_page, memcg, false, true);
 		lru_cache_add_anon(new_page);
 
 		/*
@@ -1618,13 +1613,14 @@ tree_unlocked:
 		VM_BUG_ON(nr_none);
 		spin_unlock_irq(&mapping->tree_lock);
 
-		mem_cgroup_cancel_charge(new_page, memcg, true);
 		new_page->mapping = NULL;
 	}
 
 	unlock_page(new_page);
 out:
 	VM_BUG_ON(!list_empty(&pagelist));
+	if (!IS_ERR_OR_NULL(*hpage))
+		mem_cgroup_uncharge(*hpage);
 	/* TODO: tracepoints */
 }
 

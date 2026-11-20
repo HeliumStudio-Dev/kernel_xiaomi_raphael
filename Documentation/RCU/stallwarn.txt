@@ -23,12 +23,10 @@ o	A CPU looping with preemption disabled.  This condition can
 o	A CPU looping with bottom halves disabled.  This condition can
 	result in RCU-sched and RCU-bh stalls.
 
-o	For !CONFIG_PREEMPT kernels, a CPU looping anywhere in the
-	kernel without invoking schedule().  Note that cond_resched()
-	does not necessarily prevent RCU CPU stall warnings.  Therefore,
-	if the looping in the kernel is really expected and desirable
-	behavior, you might need to replace some of the cond_resched()
-	calls with calls to cond_resched_rcu_qs().
+o	For !CONFIG_PREEMPT kernels, a CPU looping anywhere in the kernel
+	without invoking schedule().  If the looping in the kernel is
+	really expected and desirable behavior, you might need to add
+	some calls to cond_resched().
 
 o	Booting Linux using a console connection that is too slow to
 	keep up with the boot-time console-message rate.  For example,
@@ -60,10 +58,25 @@ o	A CPU-bound real-time task in a CONFIG_PREEMPT_RT kernel that
 	CONFIG_PREEMPT_RCU case, you might see stall-warning
 	messages.
 
+	You can use the rcutree.kthread_prio kernel boot parameter to
+	increase the scheduling priority of RCU's kthreads, which can
+	help avoid this problem.  However, please note that doing this
+	can increase your system's context-switch rate and thus degrade
+	performance.
+
 o	A hardware or software issue shuts off the scheduler-clock
 	interrupt on a CPU that is not in dyntick-idle mode.  This
 	problem really has happened, and seems to be most likely to
 	result in RCU CPU stall warnings for CONFIG_NO_HZ_COMMON=n kernels.
+
+o	A hardware or software issue that prevents time-based wakeups
+	from occurring.  These issues can range from misconfigured or
+	buggy timer hardware through bugs in the interrupt or exception
+	path (whether hardware, firmware, or software) through bugs
+	in Linux's timer subsystem through bugs in the scheduler, and,
+	yes, even including bugs in RCU itself.  It can also result in
+	the ``rcu_.*timer wakeup didn't happen for`` console-log message,
+	which will include additional debugging information.
 
 o	A bug in the RCU implementation.
 
@@ -233,12 +246,8 @@ kernels, if a high-priority process is starving RCU's softirq handler.
 For CONFIG_RCU_FAST_NO_HZ kernels, the "last_accelerate:" prints the
 low-order 16 bits (in hex) of the jiffies counter when this CPU last
 invoked rcu_try_advance_all_cbs() from rcu_needs_cpu() or last invoked
-rcu_accelerate_cbs() from rcu_prepare_for_idle().  The "nonlazy_posted:"
-prints the number of non-lazy callbacks posted since the last call to
-rcu_needs_cpu().  Finally, an "L" indicates that there are currently
-no non-lazy callbacks ("." is printed otherwise, as shown above) and
-"D" indicates that dyntick-idle processing is enabled ("." is printed
-otherwise, for example, if disabled via the "nohz=" kernel boot parameter).
+rcu_accelerate_cbs() from rcu_prepare_for_idle(). "dyntick_enabled: 1"
+indicates that dyntick-idle processing is enabled.
 
 If the relevant grace-period kthread has been unable to run prior to
 the stall warning, the following additional line is printed:
@@ -248,6 +257,25 @@ the stall warning, the following additional line is printed:
 Starving the grace-period kthreads of CPU time can of course result in
 RCU CPU stall warnings even when all CPUs and tasks have passed through
 the required quiescent states.
+
+If the relevant grace-period kthread does not wake from FQS wait in a
+reasonable time, then the following additional line is printed::
+
+	kthread timer wakeup didn't happen for 23804 jiffies! g7076 f0x0 RCU_GP_WAIT_FQS(5) ->state=0x402
+
+The "23804" indicates that kthread's timer expired more than 23 thousand
+jiffies ago.  The rest of the line has meaning similar to the kthread
+starvation case.
+
+Additionally, the following line is printed::
+
+	Possible timer handling issue on cpu=4 timer-softirq=11142
+
+Here "cpu" indicates that the grace-period kthread last ran on CPU 4,
+where it queued the fqs timer.  The number following the "timer-softirq"
+is the current ``TIMER_SOFTIRQ`` count on cpu 4.  If this value does not
+change on successive RCU CPU stall warnings, there is further reason to
+suspect a timer problem.
 
 
 Multiple Warnings From One Stall

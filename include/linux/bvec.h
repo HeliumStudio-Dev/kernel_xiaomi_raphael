@@ -20,6 +20,7 @@
 #ifndef __LINUX_BVEC_ITER_H
 #define __LINUX_BVEC_ITER_H
 
+#include <linux/highmem.h>
 #include <linux/kernel.h>
 #include <linux/bug.h>
 #include <linux/errno.h>
@@ -155,5 +156,27 @@ static inline void bvec_iter_skip_zero_bvec(struct bvec_iter *iter)
 		((bvl = bvec_iter_bvec((bio_vec), (iter))), 1);	\
 	     (bvl).bv_len ? (void)bvec_iter_advance((bio_vec), &(iter),	\
 		     (bvl).bv_len) : bvec_iter_skip_zero_bvec(&(iter)))
+
+/**
+ * memcpy_from_bvec - copy data from a bvec
+ * @bvec: bvec to copy from
+ *
+ * Must be called on single-page bvecs only.
+ */
+static inline void memcpy_from_bvec(char *to, struct bio_vec *bvec)
+{
+	memcpy_from_page(to, bvec->bv_page, bvec->bv_offset, bvec->bv_len);
+}
+
+/**
+ * memcpy_to_bvec - copy data to a bvec
+ * @bvec: bvec to copy to
+ *
+ * Must be called on single-page bvecs only.
+ */
+static inline void memcpy_to_bvec(struct bio_vec *bvec, const char *from)
+{
+	memcpy_to_page(bvec->bv_page, bvec->bv_offset, from, bvec->bv_len);
+}
 
 #endif /* __LINUX_BVEC_ITER_H */

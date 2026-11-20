@@ -1,0 +1,3 @@
+config MI_METIS_DUMMY
+	bool "Dummy nodes for metis framework"
+	default y

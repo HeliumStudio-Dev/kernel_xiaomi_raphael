@@ -24,21 +24,116 @@
 #include <linux/sched/energy.h>
 #include <linux/cpuset.h>
 
-DEFINE_PER_CPU(unsigned long, freq_scale) = SCHED_CAPACITY_SCALE;
-DEFINE_PER_CPU(unsigned long, efficiency) = SCHED_CAPACITY_SCALE;
+static DEFINE_PER_CPU(struct scale_freq_data *, sft_data);
+static struct cpumask scale_freq_counters_mask;
+static bool scale_freq_invariant;
+static DEFINE_PER_CPU(u32, freq_factor) = 1;
+
+static bool supports_scale_freq_counters(const struct cpumask *cpus)
+{
+	return cpumask_subset(cpus, &scale_freq_counters_mask);
+}
+
+bool topology_scale_freq_invariant(void)
+{
+	return cpufreq_supports_freq_invariance() ||
+	       supports_scale_freq_counters(cpu_online_mask);
+}
+
+static void update_scale_freq_invariant(bool status)
+{
+	if (scale_freq_invariant == status)
+		return;
+
+	/*
+	 * Task scheduler behavior depends on frequency invariance support,
+	 * either cpufreq or counter driven. If the support status changes as
+	 * a result of counter initialisation and use, retrigger the build of
+	 * scheduling domains to ensure the information is propagated properly.
+	 */
+	if (topology_scale_freq_invariant() == status) {
+		scale_freq_invariant = status;
+		rebuild_sched_domains();
+	}
+}
+
+void topology_set_scale_freq_source(struct scale_freq_data *data,
+				    const struct cpumask *cpus)
+{
+	struct scale_freq_data *sfd;
+	int cpu;
+
+	/*
+	 * Avoid calling rebuild_sched_domains() unnecessarily if FIE is
+	 * supported by cpufreq.
+	 */
+	if (cpumask_empty(&scale_freq_counters_mask))
+		scale_freq_invariant = topology_scale_freq_invariant();
+
+	for_each_cpu(cpu, cpus) {
+		sfd = per_cpu(sft_data, cpu);
+
+		/* Use ARCH provided counters whenever possible */
+		if (!sfd || sfd->source != SCALE_FREQ_SOURCE_ARCH) {
+			per_cpu(sft_data, cpu) = data;
+			cpumask_set_cpu(cpu, &scale_freq_counters_mask);
+		}
+	}
+
+	update_scale_freq_invariant(true);
+}
+
+void topology_clear_scale_freq_source(enum scale_freq_source source,
+				      const struct cpumask *cpus)
+{
+	struct scale_freq_data *sfd;
+	int cpu;
+
+	for_each_cpu(cpu, cpus) {
+		sfd = per_cpu(sft_data, cpu);
+
+		if (sfd && sfd->source == source) {
+			per_cpu(sft_data, cpu) = NULL;
+			cpumask_clear_cpu(cpu, &scale_freq_counters_mask);
+		}
+	}
+
+	update_scale_freq_invariant(false);
+}
+
+void topology_scale_freq_tick(void)
+{
+	struct scale_freq_data *sfd = *this_cpu_ptr(&sft_data);
+
+	if (sfd)
+		sfd->set_freq_scale();
+}
+
+DEFINE_PER_CPU(unsigned long, arch_freq_scale) = SCHED_CAPACITY_SCALE;
 DEFINE_PER_CPU(unsigned long, max_cpu_freq);
 DEFINE_PER_CPU(unsigned long, max_freq_scale) = SCHED_CAPACITY_SCALE;
 
-void arch_set_freq_scale(struct cpumask *cpus, unsigned long cur_freq,
+void arch_set_freq_scale(const struct cpumask *cpus, unsigned long cur_freq,
 			 unsigned long max_freq)
 {
 	unsigned long scale;
 	int i;
 
+	if (WARN_ON_ONCE(!cur_freq || !max_freq))
+		return;
+
+	/*
+	 * If the use of counters for FIE is enabled, just return as we don't
+	 * want to update the scale factor with information from CPUFREQ.
+	 * Instead the scale factor will be updated from arch_scale_freq_tick.
+	 */
+	if (supports_scale_freq_counters(cpus))
+		return;
+
 	scale = (cur_freq << SCHED_CAPACITY_SHIFT) / max_freq;
 
 	for_each_cpu(i, cpus) {
-		per_cpu(freq_scale, i) = scale;
+		per_cpu(arch_freq_scale, i) = scale;
 		per_cpu(max_cpu_freq, i) = max_freq;
 	}
 }
@@ -64,11 +159,79 @@ void arch_set_max_freq_scale(struct cpumask *cpus,
 
 static DEFINE_MUTEX(cpu_scale_mutex);
 DEFINE_PER_CPU(unsigned long, cpu_scale) = SCHED_CAPACITY_SCALE;
+DEFINE_PER_CPU(unsigned long, arch_min_freq_scale);
+
+void arch_set_min_freq_scale(const struct cpumask *cpus,
+			     unsigned long min_freq, unsigned long max_freq)
+{
+	unsigned long scale;
+	int i;
+
+	if (WARN_ON_ONCE(!max_freq))
+		return;
+
+	scale = (min_freq * per_cpu(cpu_scale, cpumask_any(cpus))) / max_freq;
+
+	for_each_cpu(i, cpus)
+		per_cpu(arch_min_freq_scale, i) = scale;
+}
 
 void topology_set_cpu_scale(unsigned int cpu, unsigned long capacity)
 {
 	per_cpu(cpu_scale, cpu) = capacity;
 }
+
+DEFINE_PER_CPU(unsigned long, thermal_pressure);
+
+void topology_set_thermal_pressure(const struct cpumask *cpus,
+			       unsigned long th_pressure)
+{
+	int cpu;
+
+	for_each_cpu(cpu, cpus)
+		WRITE_ONCE(per_cpu(thermal_pressure, cpu), th_pressure);
+}
+
+/**
+ * topology_update_thermal_pressure() - Update thermal pressure for CPUs
+ * @cpus        : The related CPUs for which capacity has been reduced
+ * @capped_freq : The maximum allowed frequency that CPUs can run at
+ *
+ * Update the value of thermal pressure for all @cpus in the mask. The
+ * cpumask should include all (online+offline) affected CPUs, to avoid
+ * operating on stale data when hot-plug is used for some CPUs. The
+ * @capped_freq reflects the currently allowed max CPUs frequency due to
+ * thermal capping. It might be also a boost frequency value, which is bigger
+ * than the internal 'freq_factor' max frequency. In such case the pressure
+ * value should simply be removed, since this is an indication that there is
+ * no thermal throttling. The @capped_freq must be provided in kHz.
+ */
+void topology_update_thermal_pressure(const struct cpumask *cpus,
+				      unsigned long capped_freq)
+{
+	unsigned long max_capacity, capacity;
+	u32 max_freq;
+	int cpu;
+
+	cpu = cpumask_first(cpus);
+	max_capacity = arch_scale_cpu_capacity(cpu);
+	max_freq = per_cpu(freq_factor, cpu);
+
+	/* Convert to MHz scale which is used in 'freq_factor' */
+	capped_freq /= 1000;
+
+	/*
+	 * Handle properly the boost frequencies, which should simply clean
+	 * the thermal pressure value.
+	 */
+	if (max_freq <= capped_freq)
+		capacity = max_capacity;
+	else
+		capacity = mult_frac(max_capacity, capped_freq, max_freq);
+
+	arch_set_thermal_pressure(cpus, max_capacity - capacity);
+}
+EXPORT_SYMBOL_GPL(topology_update_thermal_pressure);
 
 static ssize_t cpu_capacity_show(struct device *dev,
 				 struct device_attribute *attr,
@@ -76,7 +239,7 @@ static ssize_t cpu_capacity_show(struct device *dev,
 {
 	struct cpu *cpu = container_of(dev, struct cpu, dev);
 
-	return sprintf(buf, "%lu\n", topology_get_cpu_scale(NULL, cpu->dev.id));
+	return sprintf(buf, "%lu\n", topology_get_cpu_scale(cpu->dev.id));
 }
 
 static void update_topology_flags_workfn(struct work_struct *work);
@@ -117,7 +280,7 @@ static ssize_t cpu_capacity_store(struct device *dev,
 				topology_core_cpumask(this_cpu));
 
 		for_each_cpu(i, mask) {
-			if (topology_get_cpu_scale(NULL, i) ==
+			if (topology_get_cpu_scale(i) ==
 					SCHED_CAPACITY_SCALE) {
 				highest_score_cpu = 1;
 				break;
@@ -136,8 +299,7 @@ static ssize_t cpu_capacity_store(struct device *dev,
 		topology_set_cpu_scale(i, new_capacity);
 	mutex_unlock(&cpu_scale_mutex);
 
-	if (topology_detect_flags())
-		schedule_work(&update_topology_flags_work);
+	schedule_work(&update_topology_flags_work);
 
 	return count;
 }
@@ -163,167 +325,7 @@ static int register_cpu_capacity_sysctl(void)
 }
 subsys_initcall(register_cpu_capacity_sysctl);
 
-enum asym_cpucap_type { no_asym, asym_thread, asym_core, asym_die };
-static enum asym_cpucap_type asym_cpucap = no_asym;
-enum share_cap_type { no_share_cap, share_cap_thread, share_cap_core, share_cap_die};
-static enum share_cap_type share_cap = no_share_cap;
-
-#ifdef CONFIG_CPU_FREQ
-int detect_share_cap_flag(void)
-{
-	int cpu;
-	enum share_cap_type share_cap_level = no_share_cap;
-	struct cpufreq_policy *policy;
-
-	for_each_possible_cpu(cpu) {
-		policy = cpufreq_cpu_get(cpu);
-
-		if (!policy)
-			return 0;
-
-		if (cpumask_equal(cpu_cpu_mask(cpu),
-				  policy->related_cpus)) {
-			share_cap_level = share_cap_die;
-			continue;
-		}
-
-		if (cpumask_equal(topology_core_cpumask(cpu),
-				  policy->related_cpus)) {
-			share_cap_level = share_cap_core;
-			continue;
-		}
-
-		if (cpumask_equal(topology_sibling_cpumask(cpu),
-				  policy->related_cpus)) {
-			share_cap_level = share_cap_thread;
-			continue;
-		}
-	}
-
-	if (share_cap != share_cap_level) {
-		share_cap = share_cap_level;
-		return 1;
-	}
-
-	return 0;
-}
-#else
-int detect_share_cap_flag(void) { return 0; }
-#endif
-
-/*
- * Walk cpu topology to determine sched_domain flags.
- *
- * SD_ASYM_CPUCAPACITY: Indicates the lowest level that spans all cpu
- * capacities found in the system for all cpus, i.e. the flag is set
- * at the same level for all systems. The current algorithm implements
- * this by looking for higher capacities, which doesn't work for all
- * conceivable topology, but don't complicate things until it is
- * necessary.
- */
-int topology_detect_flags(void)
-{
-	unsigned long max_capacity, capacity;
-	enum asym_cpucap_type asym_level = no_asym;
-	int cpu, die_cpu, core, thread, flags_changed = 0;
-
-	for_each_possible_cpu(cpu) {
-		max_capacity = 0;
-
-		if (asym_level >= asym_thread)
-			goto check_core;
-
-		for_each_cpu(thread, topology_sibling_cpumask(cpu)) {
-			capacity = topology_get_cpu_scale(NULL, thread);
-
-			if (capacity > max_capacity) {
-				if (max_capacity != 0)
-					asym_level = asym_thread;
-
-				max_capacity = capacity;
-			}
-		}
-
-check_core:
-		if (asym_level >= asym_core)
-			goto check_die;
-
-		for_each_cpu(core, topology_core_cpumask(cpu)) {
-			capacity = topology_get_cpu_scale(NULL, core);
-
-			if (capacity > max_capacity) {
-				if (max_capacity != 0)
-					asym_level = asym_core;
-
-				max_capacity = capacity;
-			}
-		}
-check_die:
-		for_each_possible_cpu(die_cpu) {
-			capacity = topology_get_cpu_scale(NULL, die_cpu);
-
-			if (capacity > max_capacity) {
-				if (max_capacity != 0) {
-					asym_level = asym_die;
-					goto done;
-				}
-			}
-		}
-	}
-
-done:
-	if (asym_cpucap != asym_level) {
-		asym_cpucap = asym_level;
-		flags_changed = 1;
-		pr_debug("topology flag change detected\n");
-	}
-
-	if (detect_share_cap_flag())
-		flags_changed = 1;
-
-	return flags_changed;
-}
-
-int topology_smt_flags(void)
-{
-	int flags = 0;
-
-	if (asym_cpucap == asym_thread)
-		flags |= SD_ASYM_CPUCAPACITY;
-
-	if (share_cap >= share_cap_thread)
-		flags |= SD_SHARE_CAP_STATES;
-
-	return flags;
-}
-
-int topology_core_flags(void)
-{
-	int flags = 0;
-
-	if (asym_cpucap == asym_core)
-		flags |= SD_ASYM_CPUCAPACITY;
-
-	if (share_cap >= share_cap_core)
-		flags |= SD_SHARE_CAP_STATES;
-
-	return flags;
-}
-
-int topology_cpu_flags(void)
-{
-	int flags = 0;
-
-	if (asym_cpucap == asym_die)
-		flags |= SD_ASYM_CPUCAPACITY;
-
-	if (share_cap >= share_cap_die)
-		flags |= SD_SHARE_CAP_STATES;
-
-	return flags;
-}
-
-static int update_topology = 0;
+static int update_topology;
 
 int topology_update_cpu_topology(void)
 {
@@ -342,7 +344,6 @@ static void update_topology_flags_workfn(struct work_struct *work)
 	update_topology = 0;
 }
 
-static u32 capacity_scale;
 static u32 *raw_capacity;
 
 static int free_raw_capacity(void)
@@ -356,19 +357,27 @@ static int free_raw_capacity(void)
 void topology_normalize_cpu_scale(void)
 {
 	u64 capacity;
+	u64 capacity_scale;
 	int cpu;
 
 	if (!raw_capacity)
 		return;
 
-	pr_debug("cpu_capacity: capacity_scale=%u\n", capacity_scale);
+	capacity_scale = 1;
 	mutex_lock(&cpu_scale_mutex);
 	for_each_possible_cpu(cpu) {
-		capacity = (raw_capacity[cpu] << SCHED_CAPACITY_SHIFT)
-			/ capacity_scale;
+		capacity = raw_capacity[cpu] * per_cpu(freq_factor, cpu);
+		capacity_scale = max(capacity, capacity_scale);
+	}
+
+	pr_debug("cpu_capacity: capacity_scale=%llu\n", capacity_scale);
+	for_each_possible_cpu(cpu) {
+		capacity = raw_capacity[cpu] * per_cpu(freq_factor, cpu);
+		capacity = div64_u64(capacity << SCHED_CAPACITY_SHIFT,
+			capacity_scale);
 		topology_set_cpu_scale(cpu, capacity);
 		pr_debug("cpu_capacity: CPU%d cpu_capacity=%lu raw_capacity=%u\n",
-			cpu, topology_get_cpu_scale(NULL, cpu),
+			cpu, topology_get_cpu_scale(cpu),
 			raw_capacity[cpu]);
 	}
 	mutex_unlock(&cpu_scale_mutex);
@@ -376,6 +385,7 @@ void topology_normalize_cpu_scale(void)
 
 bool __init topology_parse_cpu_capacity(struct device_node *cpu_node, int cpu)
 {
+	struct clk *cpu_clk;
 	static bool cap_parsing_failed;
 	int ret;
 	u32 cpu_capacity;
@@ -386,7 +396,6 @@ bool __init topology_parse_cpu_capacity(struct device_node *cpu_node, int cpu)
 	ret = of_property_read_u32(cpu_node, "capacity-dmips-mhz",
 				   &cpu_capacity);
 	if (!ret) {
-		per_cpu(efficiency, cpu) = cpu_capacity;
 		if (!raw_capacity) {
 			raw_capacity = kcalloc(num_possible_cpus(),
 					       sizeof(*raw_capacity),
@@ -397,10 +406,22 @@ bool __init topology_parse_cpu_capacity(struct device_node *cpu_node, int cpu)
 				return false;
 			}
 		}
-		capacity_scale = max(cpu_capacity, capacity_scale);
 		raw_capacity[cpu] = cpu_capacity;
 		pr_debug("cpu_capacity: %pOF cpu_capacity=%u (raw)\n",
 			cpu_node, raw_capacity[cpu]);
+
+		/*
+		 * Update freq_factor for calculating early boot cpu capacities.
+		 * For non-clk CPU DVFS mechanism, there's no way to get the
+		 * frequency value now, assuming they are running at the same
+		 * frequency (by keeping the initial freq_factor value).
+		 */
+		cpu_clk = of_clk_get(cpu_node, 0);
+		if (!PTR_ERR_OR_ZERO(cpu_clk)) {
+			per_cpu(freq_factor, cpu) =
+				clk_get_rate(cpu_clk) / 1000;
+			clk_put(cpu_clk);
+		}
 	} else {
 		if (raw_capacity) {
 			pr_err("cpu_capacity: missing %pOF raw capacity\n",
@@ -439,17 +460,13 @@ init_cpu_capacity_callback(struct notifier_block *nb,
 
 	cpumask_andnot(cpus_to_visit, cpus_to_visit, policy->related_cpus);
 
-	for_each_cpu(cpu, policy->related_cpus) {
-		raw_capacity[cpu] = topology_get_cpu_scale(NULL, cpu) *
-				    policy->cpuinfo.max_freq / 1000UL;
-		capacity_scale = max(raw_capacity[cpu], capacity_scale);
-	}
+	for_each_cpu(cpu, policy->related_cpus)
+		per_cpu(freq_factor, cpu) = policy->cpuinfo.max_freq / 1000;
 
 	if (cpumask_empty(cpus_to_visit)) {
 		topology_normalize_cpu_scale();
 		init_sched_energy_costs();
-		if (topology_detect_flags())
-			schedule_work(&update_topology_flags_work);
+		schedule_work(&update_topology_flags_work);
 		free_raw_capacity();
 		pr_debug("cpu_capacity: parsing done\n");
 		schedule_work(&parsing_done_work);

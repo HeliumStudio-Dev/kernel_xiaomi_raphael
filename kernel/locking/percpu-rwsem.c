@@ -7,6 +7,8 @@
 #include <linux/sched.h>
 #include <linux/errno.h>
 
+#include "rwsem.h"
+
 int __percpu_init_rwsem(struct percpu_rw_semaphore *sem,
 			const char *name, struct lock_class_key *rwsem_key)
 {
@@ -15,7 +17,7 @@ int __percpu_init_rwsem(struct percpu_rw_semaphore *sem,
 		return -ENOMEM;
 
 	/* ->rw_sem represents the whole percpu_rw_semaphore for lockdep */
-	rcu_sync_init(&sem->rss, RCU_SCHED_SYNC);
+	rcu_sync_init(&sem->rss);
 	__init_rwsem(&sem->rw_sem, name, rwsem_key);
 	rcuwait_init(&sem->writer);
 	sem->readers_block = 0;
@@ -159,7 +161,7 @@ void percpu_down_write(struct percpu_rw_semaphore *sem)
 	 */
 
 	/* Wait for all now active readers to complete. */
-	rcuwait_wait_event(&sem->writer, readers_active_check(sem));
+	rcuwait_wait_event(&sem->writer, readers_active_check(sem), TASK_UNINTERRUPTIBLE);
 }
 EXPORT_SYMBOL_GPL(percpu_down_write);
 

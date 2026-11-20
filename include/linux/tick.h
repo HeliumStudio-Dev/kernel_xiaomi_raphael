@@ -102,14 +102,19 @@ enum tick_dep_bits {
 	TICK_DEP_BIT_POSIX_TIMER	= 0,
 	TICK_DEP_BIT_PERF_EVENTS	= 1,
 	TICK_DEP_BIT_SCHED		= 2,
-	TICK_DEP_BIT_CLOCK_UNSTABLE	= 3
+	TICK_DEP_BIT_CLOCK_UNSTABLE	= 3,
+	TICK_DEP_BIT_RCU		= 4,
+	TICK_DEP_BIT_RCU_EXP		= 5
 };
+#define TICK_DEP_BIT_MAX TICK_DEP_BIT_RCU_EXP
 
 #define TICK_DEP_MASK_NONE		0
 #define TICK_DEP_MASK_POSIX_TIMER	(1 << TICK_DEP_BIT_POSIX_TIMER)
 #define TICK_DEP_MASK_PERF_EVENTS	(1 << TICK_DEP_BIT_PERF_EVENTS)
 #define TICK_DEP_MASK_SCHED		(1 << TICK_DEP_BIT_SCHED)
 #define TICK_DEP_MASK_CLOCK_UNSTABLE	(1 << TICK_DEP_BIT_CLOCK_UNSTABLE)
+#define TICK_DEP_MASK_RCU		(1 << TICK_DEP_BIT_RCU)
+#define TICK_DEP_MASK_RCU_EXP		(1 << TICK_DEP_BIT_RCU_EXP)
 
 #ifdef CONFIG_NO_HZ_COMMON
 extern bool tick_nohz_enabled;
@@ -158,7 +163,6 @@ static inline void tick_nohz_idle_stop_tick_protected(void) { }
 #ifdef CONFIG_NO_HZ_FULL
 extern bool tick_nohz_full_running;
 extern cpumask_var_t tick_nohz_full_mask;
-extern cpumask_var_t housekeeping_mask;
 
 static inline bool tick_nohz_full_enabled(void)
 {
@@ -180,11 +184,6 @@ static inline void tick_nohz_full_add_cpus_to(struct cpumask *mask)
 {
 	if (tick_nohz_full_enabled())
 		cpumask_or(mask, mask, tick_nohz_full_mask);
-}
-
-static inline int housekeeping_any_cpu(void)
-{
-	return cpumask_any_and(housekeeping_mask, cpu_online_mask);
 }
 
 extern void tick_nohz_dep_set(enum tick_dep_bits bit);
@@ -256,21 +255,12 @@ static inline void tick_dep_clear_signal(struct signal_struct *signal,
 extern void tick_nohz_full_kick_cpu(int cpu);
 extern void __tick_nohz_task_switch(void);
 #else
-static inline int housekeeping_any_cpu(void)
-{
-	cpumask_t available;
-	int cpu;
-
-	cpumask_andnot(&available, cpu_online_mask, cpu_isolated_mask);
-	cpu = cpumask_any(&available);
-	if (cpu >= nr_cpu_ids)
-		cpu = smp_processor_id();
-
-	return cpu;
-}
 static inline bool tick_nohz_full_enabled(void) { return false; }
 static inline bool tick_nohz_full_cpu(int cpu) { return false; }
 static inline void tick_nohz_full_add_cpus_to(struct cpumask *mask) { }
+
+static inline void tick_nohz_dep_set_cpu(int cpu, enum tick_dep_bits bit) { }
+static inline void tick_nohz_dep_clear_cpu(int cpu, enum tick_dep_bits bit) { }
 
 static inline void tick_dep_set(enum tick_dep_bits bit) { }
 static inline void tick_dep_clear(enum tick_dep_bits bit) { }
@@ -289,9 +279,23 @@ static inline void tick_nohz_full_kick_cpu(int cpu) { }
 static inline void __tick_nohz_task_switch(void) { }
 #endif
 
+#ifdef CONFIG_CPU_ISOLATION
+extern cpumask_var_t housekeeping_mask;
+
+static inline int housekeeping_any_cpu(void)
+{
+	return cpumask_any_and(housekeeping_mask, cpu_online_mask);
+}
+#else
+static inline int housekeeping_any_cpu(void)
+{
+	return smp_processor_id();
+}
+#endif /* CONFIG_CPU_ISOLATION */
+
 static inline const struct cpumask *housekeeping_cpumask(void)
 {
-#ifdef CONFIG_NO_HZ_FULL
+#ifdef CONFIG_CPU_ISOLATION
 	if (tick_nohz_full_enabled())
 		return housekeeping_mask;
 #endif
@@ -300,16 +304,16 @@ static inline const struct cpumask *housekeeping_cpumask(void)
 
 static inline bool is_housekeeping_cpu(int cpu)
 {
-#ifdef CONFIG_NO_HZ_FULL
+#ifdef CONFIG_CPU_ISOLATION
 	if (tick_nohz_full_enabled())
 		return cpumask_test_cpu(cpu, housekeeping_mask);
 #endif
-	return !cpu_isolated(cpu);
+	return true;
 }
 
 static inline void housekeeping_affine(struct task_struct *t)
 {
-#ifdef CONFIG_NO_HZ_FULL
+#ifdef CONFIG_CPU_ISOLATION
 	if (tick_nohz_full_enabled())
 		set_cpus_allowed_ptr(t, housekeeping_mask);
 

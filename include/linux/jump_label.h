@@ -82,9 +82,9 @@
 
 extern bool static_key_initialized;
 
-#define STATIC_KEY_CHECK_USE() WARN(!static_key_initialized,		      \
-				    "%s used before call to jump_label_init", \
-				    __func__)
+#define STATIC_KEY_CHECK_USE(key) WARN(!static_key_initialized,		      \
+				    "%s(): static key '%pS' used before call to jump_label_init()", \
+				    __func__, (key))
 
 #ifdef HAVE_JUMP_LABEL
 
@@ -119,6 +119,68 @@ struct static_key {
 
 #ifdef HAVE_JUMP_LABEL
 #include <asm/jump_label.h>
+
+#ifndef __ASSEMBLY__
+#ifdef CONFIG_HAVE_ARCH_JUMP_LABEL_RELATIVE
+
+struct jump_entry {
+	s32 code;
+	s32 target;
+	long key;	// key may be far away from the core kernel under KASLR
+};
+
+static inline unsigned long jump_entry_code(const struct jump_entry *entry)
+{
+	return (unsigned long)&entry->code + entry->code;
+}
+
+static inline unsigned long jump_entry_target(const struct jump_entry *entry)
+{
+	return (unsigned long)&entry->target + entry->target;
+}
+
+static inline struct static_key *jump_entry_key(const struct jump_entry *entry)
+{
+	long offset = entry->key & ~3L;
+
+	return (struct static_key *)((unsigned long)&entry->key + offset);
+}
+
+#else
+
+static inline unsigned long jump_entry_code(const struct jump_entry *entry)
+{
+	return entry->code;
+}
+
+static inline unsigned long jump_entry_target(const struct jump_entry *entry)
+{
+	return entry->target;
+}
+
+static inline struct static_key *jump_entry_key(const struct jump_entry *entry)
+{
+	return (struct static_key *)((unsigned long)entry->key & ~3UL);
+}
+
+#endif
+
+static inline bool jump_entry_is_branch(const struct jump_entry *entry)
+{
+	return (unsigned long)entry->key & 1UL;
+}
+
+static inline bool jump_entry_is_init(const struct jump_entry *entry)
+{
+	return (unsigned long)entry->key & 2UL;
+}
+
+static inline void jump_entry_set_init(struct jump_entry *entry)
+{
+	entry->key |= 2;
+}
+
+#endif
 #endif
 
 #ifndef __ASSEMBLY__
@@ -214,13 +276,13 @@ static __always_inline bool static_key_true(struct static_key *key)
 
 static inline void static_key_slow_inc(struct static_key *key)
 {
-	STATIC_KEY_CHECK_USE();
+	STATIC_KEY_CHECK_USE(key);
 	atomic_inc(&key->enabled);
 }
 
 static inline void static_key_slow_dec(struct static_key *key)
 {
-	STATIC_KEY_CHECK_USE();
+	STATIC_KEY_CHECK_USE(key);
 	atomic_dec(&key->enabled);
 }
 
@@ -242,7 +304,7 @@ static inline int jump_label_apply_nops(struct module *mod)
 
 static inline void static_key_enable(struct static_key *key)
 {
-	STATIC_KEY_CHECK_USE();
+	STATIC_KEY_CHECK_USE(key);
 
 	if (atomic_read(&key->enabled) != 0) {
 		WARN_ON_ONCE(atomic_read(&key->enabled) != 1);
@@ -253,7 +315,7 @@ static inline void static_key_enable(struct static_key *key)
 
 static inline void static_key_disable(struct static_key *key)
 {
-	STATIC_KEY_CHECK_USE();
+	STATIC_KEY_CHECK_USE(key);
 
 	if (atomic_read(&key->enabled) != 1) {
 		WARN_ON_ONCE(atomic_read(&key->enabled) != 0);
@@ -393,7 +455,7 @@ extern bool ____wrong_branch_error(void);
 		branch = !arch_static_branch_jump(&(x)->key, true);		\
 	else									\
 		branch = ____wrong_branch_error();				\
-	branch;									\
+	likely(branch);								\
 })
 
 #define static_branch_unlikely(x)						\
@@ -405,7 +467,7 @@ extern bool ____wrong_branch_error(void);
 		branch = arch_static_branch(&(x)->key, false);			\
 	else									\
 		branch = ____wrong_branch_error();				\
-	branch;									\
+	unlikely(branch);							\
 })
 
 #else /* !HAVE_JUMP_LABEL */

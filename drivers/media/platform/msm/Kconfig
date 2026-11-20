@@ -38,6 +38,12 @@ config MSM_CAMERA_DEBUG
     ---help---
       Enable printk() debug for msm camera
 
+menuconfig CAMERA_DISABLE_DUMP_STATE
+    bool "Qualcomm Technologies, Inc. Spectra camera and video capture disable dump state"
+    depends on ARCH_QCOM && VIDEO_V4L2 && I2C
+    ---help---
+      Say Y here to disable dump state monitor array
+
 menuconfig MSMB_CAMERA
     bool "QTI MSM camera and video capture 2.0 support"
     depends on ARCH_QCOM && VIDEO_V4L2 && I2C
@@ -56,6 +62,14 @@ config MSMB_CAMERA_DEBUG
 if MSMB_CAMERA
 source "drivers/media/platform/msm/camera_v2/Kconfig"
 endif # MSMB_CAMERA
+
+config USE_ROHM_BU64753
+        bool "use ROHM BU64753 acculator"
+        default n
+
+config VCM_AK7374
+	bool "use ak7374 vcm"
+	default n
 
 source "drivers/media/platform/msm/vidc_3x/Kconfig"
 source "drivers/media/platform/msm/vidc/Kconfig"

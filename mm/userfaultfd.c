@@ -97,7 +97,6 @@ static int mcopy_atomic_pte(struct mm_struct *dst_mm,
 			    struct page **pagep,
 			    bool wp_copy)
 {
-	struct mem_cgroup *memcg;
 	void *page_kaddr;
 	int ret;
 	struct page *page;
@@ -136,16 +135,13 @@ static int mcopy_atomic_pte(struct mm_struct *dst_mm,
 	__SetPageUptodate(page);
 
 	ret = -ENOMEM;
-	if (mem_cgroup_try_charge(page, dst_mm, GFP_KERNEL, &memcg, false))
+	if (mem_cgroup_charge(page, dst_mm, GFP_KERNEL, false))
 		goto out_release;
 
 	ret = mfill_atomic_install_pte(dst_mm, dst_pmd, dst_vma, dst_addr,
 				       page, true, wp_copy);
-	if (ret) {
-		mem_cgroup_cancel_charge(page, memcg, false);
+	if (ret)
 		goto out_release;
-	}
-	mem_cgroup_commit_charge(page, memcg, false, false);
 out:
 	return ret;
 out_release:

@@ -42,9 +42,11 @@
 #include <linux/cn_proc.h>
 #include <linux/compiler.h>
 #include <linux/posix-timers.h>
-#include <linux/oom.h>
-#include <linux/capability.h>
 #include <linux/cgroup.h>
+
+#if IS_ENABLED(CONFIG_MILLET)
+#include <linux/millet.h>
+#endif
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/signal.h>
@@ -1220,6 +1222,21 @@ int do_send_sig_info(int sig, struct siginfo *info, struct task_struct *p,
 	unsigned long flags;
 	int ret = -ESRCH;
 
+#if IS_ENABLED(CONFIG_MILLET)
+	struct millet_data data;
+
+	if (sig == SIGKILL
+		|| sig == SIGTERM
+		|| sig == SIGABRT
+		|| sig == SIGQUIT) {
+
+		data.mod.k_priv.sig.caller_task = current;
+		data.mod.k_priv.sig.killed_task = p;
+		data.mod.k_priv.sig.reason = KILLED_BY_PRO;
+		millet_sendmsg(SIG_TYPE, p, &data);
+	}
+#endif
+
 	if (lock_task_sighand(p, &flags)) {
 		ret = send_signal(sig, info, p, group);
 		unlock_task_sighand(p, &flags);
@@ -1347,11 +1364,8 @@ int group_send_sig_info(int sig, struct siginfo *info, struct task_struct *p,
 	ret = check_kill_permission(sig, info, p);
 	rcu_read_unlock();
 
-	if (!ret && sig) {
+	if (!ret && sig)
 		ret = do_send_sig_info(sig, info, p, true);
-		if (capable(CAP_KILL) && sig == SIGKILL)
-			add_to_oom_reaper(p);
-	}
 
 	return ret;
 }
@@ -1966,9 +1980,10 @@ static void ptrace_stop(int exit_code, int why, int clear_code, siginfo_t *info)
 		 */
 		preempt_disable();
 		read_unlock(&tasklist_lock);
-		preempt_enable_no_resched();
 		cgroup_enter_frozen();
+		preempt_enable_no_resched();
 		freezable_schedule();
+		cgroup_leave_frozen(true);
 	} else {
 		/*
 		 * By the time we got the lock, our tracer went away.
@@ -3152,8 +3167,11 @@ static bool access_pidfd_pidns(struct pid *pid)
 
 static struct pid *pidfd_to_pid(const struct file *file)
 {
-	if (file->f_op == &pidfd_fops)
-		return file->private_data;
+	struct pid *pid;
+
+	pid = pidfd_pid(file);
+	if (!IS_ERR(pid))
+		return pid;
 
 	return tgid_pidfd_to_pid(file);
 }
@@ -3986,6 +4004,42 @@ __weak const char *arch_vma_name(struct vm_area_struct *vma)
 	return NULL;
 }
 
+#if IS_ENABLED(CONFIG_MILLET)
+int last_report_task;
+
+static int signals_sendmsg(struct task_struct *tsk,
+		struct millet_data *data, struct millet_sock *sk)
+{
+	int ret = 0;
+
+	if (!sk || !data || !tsk) {
+		pr_err("%s input invalid\n", __FUNCTION__);
+		return RET_ERR;
+	}
+
+	data->mod.k_priv.sig.killed_pid = task_tgid_nr(tsk);
+	data->uid = task_uid(tsk).val;
+	data->msg_type = MSG_TO_USER;
+	data->owner = SIG_TYPE;
+
+	if (frozen_task_group(tsk)
+		&& (data->mod.k_priv.sig.killed_pid != *(int *)sk->mod[SIG_TYPE].priv)) {
+		*(int *)sk->mod[SIG_TYPE].priv = data->mod.k_priv.sig.killed_pid;
+		ret = millet_sendto_user(tsk, data, sk);
+	}
+
+	return ret;
+}
+
+static void signas_init_millet(struct millet_sock *sk)
+{
+	if (sk) {
+		sk->mod[SIG_TYPE].monitor = SIG_TYPE;
+		sk->mod[SIG_TYPE].priv = (void *)&last_report_task;
+	}
+}
+#endif
+
 void __init signals_init(void)
 {
 	/* If this check fails, the __ARCH_SI_PREAMBLE_SIZE value is wrong! */
@@ -3993,6 +4047,10 @@ void __init signals_init(void)
 		!= offsetof(struct siginfo, _sifields._pad));
 
 	sigqueue_cachep = KMEM_CACHE(sigqueue, SLAB_PANIC);
+#if IS_ENABLED(CONFIG_MILLET)
+	register_millet_hook(SIG_TYPE, NULL,
+		signals_sendmsg, signas_init_millet);
+#endif
 }
 
 #ifdef CONFIG_KGDB_KDB

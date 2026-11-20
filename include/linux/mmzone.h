@@ -7,6 +7,7 @@
 
 #include <linux/spinlock.h>
 #include <linux/list.h>
+#include <linux/list_nulls.h>
 #include <linux/wait.h>
 #include <linux/bitops.h>
 #include <linux/cache.h>
@@ -18,6 +19,7 @@
 #include <linux/pageblock-flags.h>
 #include <linux/page-flags-layout.h>
 #include <linux/atomic.h>
+#include <linux/kfifo.h>
 #include <asm/page.h>
 
 /* Free memory management - zoned buddy allocator.  */
@@ -166,9 +168,15 @@ enum node_stat_item {
 	NR_SLAB_UNRECLAIMABLE,
 	NR_ISOLATED_ANON,	/* Temporary isolated pages from anon lru */
 	NR_ISOLATED_FILE,	/* Temporary isolated pages from file lru */
-	WORKINGSET_REFAULT,
-	WORKINGSET_ACTIVATE,
-	WORKINGSET_RESTORE,
+	WORKINGSET_REFAULT_BASE,
+	WORKINGSET_REFAULT_ANON = WORKINGSET_REFAULT_BASE,
+	WORKINGSET_REFAULT_FILE,
+	WORKINGSET_ACTIVATE_BASE,
+	WORKINGSET_ACTIVATE_ANON = WORKINGSET_ACTIVATE_BASE,
+	WORKINGSET_ACTIVATE_FILE,
+	WORKINGSET_RESTORE_BASE,
+	WORKINGSET_RESTORE_ANON = WORKINGSET_RESTORE_BASE,
+	WORKINGSET_RESTORE_FILE,
 	WORKINGSET_NODERECLAIM,
 	NR_ANON_MAPPED,	/* Mapped anonymous pages */
 	NR_FILE_MAPPED,	/* pagecache pages mapped into pagetables.
@@ -186,6 +194,7 @@ enum node_stat_item {
 	NR_VMSCAN_IMMEDIATE,	/* Prioritise for reclaim when writeback ends */
 	NR_DIRTIED,		/* page dirtyings since bootup */
 	NR_WRITTEN,		/* page writings since bootup */
+	NR_THROTTLED_WRITTEN,	/* NR_WRITTEN while reclaim throttled */
 	NR_KERNEL_MISC_RECLAIMABLE,	/* reclaimable non-slab kernel pages */
 	NR_UNRECLAIMABLE_PAGES,
 	NR_VM_NODE_STAT_ITEMS
@@ -213,6 +222,11 @@ enum lru_list {
 	NR_LRU_LISTS
 };
 
+enum vmscan_throttle_state {
+	VMSCAN_THROTTLE_WRITEBACK,
+	NR_VMSCAN_THROTTLE,
+};
+
 #define for_each_lru(lru) for (lru = 0; lru < NR_LRU_LISTS; lru++)
 
 #define for_each_evictable_lru(lru) for (lru = 0; lru <= LRU_ACTIVE_FILE; lru++)
@@ -227,26 +241,414 @@ static inline int is_active_lru(enum lru_list lru)
 	return (lru == LRU_ACTIVE_ANON || lru == LRU_ACTIVE_FILE);
 }
 
+#define ANON_AND_FILE 2
+
 struct zone_reclaim_stat {
 	/*
 	 * The pageout code in vmscan.c keeps track of how many of the
 	 * mem/swap backed and file backed pages are referenced.
 	 * The higher the rotated/scanned ratio, the more valuable
 	 * that cache is.
-	 *
-	 * The anon LRU stats live in [0], file LRU stats in [1]
 	 */
-	unsigned long		recent_rotated[2];
-	unsigned long		recent_scanned[2];
+	unsigned long		recent_rotated[ANON_AND_FILE];
+	unsigned long		recent_scanned[ANON_AND_FILE];
 };
+
+#endif /* !__GENERATING_BOUNDS_H */
+
+/*
+ * Evictable pages are divided into multiple generations. The youngest and the
+ * oldest generation numbers, max_seq and min_seq, are monotonically increasing.
+ * They form a sliding window of a variable size [MIN_NR_GENS, MAX_NR_GENS]. An
+ * offset within MAX_NR_GENS, i.e., gen, indexes the LRU list of the
+ * corresponding generation. The gen counter in page->flags stores gen+1 while
+ * a page is on one of lrugen->folios[]. Otherwise it stores 0.
+ *
+ * After a page is faulted in, the aging needs to check the accessed bit at
+ * least twice before handing this page over to the eviction. The first check
+ * clears the accessed bit from the initial fault; the second check makes sure
+ * this page hasn't been used since then. This process, AKA second chance,
+ * requires a minimum of two generations, hence MIN_NR_GENS.
+ * Active/inactive accounting is per-page based on the referenced count;
+ * see the comment above MAX_NR_TIERS.
+ *
+ * PG_active is always cleared while a page is on one of lrugen->folios[] so
+ * that the sliding window needs not to worry about it. And it's set again when
+ * a page considered active is isolated for non-reclaiming purposes, e.g.,
+ * migration. See lru_gen_add_page() and lru_gen_del_page().
+ *
+ * MAX_NR_GENS is set to 4 so that the multi-gen LRU can support twice the
+ * number of categories of the active/inactive LRU when keeping track of
+ * accesses through page tables. This requires order_base_2(MAX_NR_GENS+1) bits
+ * in page->flags, masked by LRU_GEN_MASK.
+ */
+#define MIN_NR_GENS		2U
+#define MAX_NR_GENS		4U
+
+/*
+ * Each generation is divided into multiple tiers. A page's referenced
+ * count maps to a tier as shown below:
+ *
+ * MGLRU (frequency guidance)
+ *  Refs  Tier  |- Refs: how many times (at least) a page has been referenced.
+ *   0      0   |- Mostly cold pages, readahead, etc. [1]
+ *   1      0   |= LRU_REFS_REFERENCED: Used at least once. [2]
+ * -WORKINGSET-+|- Pages beyond are workingset and never fall below this floor. [3]
+ *   2      1<-+|= LRU_REFS_WORKINGSET: Classical workingset, accessed twice, protected. [4]
+ *   3      2   |- LRU_REFS_PROTECTED: Protected workingset, promoted pages capped at here. [5]
+ *   4      2   |
+ *   5      3   |- The tier here is MAX_NR_TIERS - 1
+ *   6      3   |
+ *   7      3   |= LRU_REFS_MAX: Promotion candidate. [6]
+ * -PROMOTION->-/
+ *
+ * Ideally each tier holds pages of similar access patterns: lower tiers
+ * are less important and evicted faster.  A page's reference count and
+ * tier are capped when it changes generation, preventing it from
+ * dominating the new generation based on old-generation access history.
+ * Generation ordering already ensures a newer-gen page is hotter than an
+ * older-gen one regardless of tier.
+ *
+ * Refs tracks accesses from two sources: page table (lazily collected by
+ * the page table aging walk or rmap eviction lookup) and file descriptors
+ * (by mark_page_accessed).  Page table accesses are weighted heavier
+ * because the accessed bit is sticky (undercounts repeated accesses),
+ * passively collected, and page faults are generally more important as
+ * userspace does not expect a memory access to block on reclaim.  Both
+ * access types increment refs by one; the result is capped at
+ * LRU_REFS_PROTECTED on promotion or deferral, or LRU_REFS_MAX otherwise.
+ *
+ * 1. Tier is fls(N-1) for N > 1, 0 otherwise.  Pages with zero
+ *    accesses (refs == 0) are generally cold, e.g. readahead pages.
+ *
+ *    Freshly allocated pages start with refs == 0; faulted and mapped
+ *    pages have their page table access bit set, so the first page table
+ *    access check always sets LRU_REFS_REFERENCED.  That is the second
+ *    chance described above MIN_NR_GENS: it only moves the page one
+ *    generation forward if it is in the oldest generation.
+ *
+ * 2. Pages accessed once stay on tier 0: one-time usage does not
+ *    qualify for protection.  A second access advances the page,
+ *    aligning with classical LRU's use-twice threshold.  A second page
+ *    table access promotes to the latest gen; file access only defers
+ *    eviction from the oldest gen.
+ *
+ * 3. Pages accessed at least twice are considered workingset.  This
+ *    mostly aligns with classical LRU: at least one I/O is saved by
+ *    keeping them in memory.  Pages at or above this level never fall
+ *    below tier 1 (the workingset floor), so tier 0 stays a clean tier
+ *    for cold cache while tier 1 serves as the fallback line for
+ *    actually reused or historically hot pages.
+ *
+ *    Pages refaulted through a page fault at refs 1 will enter the second
+ *    newest gen, so faulting will be protected better.
+ *
+ * 4. Starting from tier 1, PID protection sacrifices lower tiers to
+ *    protect higher tiers by comparing refault rates for long-term
+ *    accuracy, and caps higher refs to this value.  Since PID protection
+ *    bypasses page table lookup and clearing, when a further eviction
+ *    attempt occurs after PID loosens, the page's page table access is
+ *    rechecked and a referenced page is put back with refs capped to
+ *    this value as well.  This also gives pages a fair opportunity to be
+ *    promoted by file access again.
+ *
+ *    Pages refaulted through a page fault at tier 1 or above are activated
+ *    and enter the newest gen. Non-fault page will enter second oldest gen,
+ *    driving aging and workingset shifting.
+ *
+ * 5. Pages beyond the ordinary workingset tier form new tiers for the
+ *    PID controller to protect differently.  Pages at or above this
+ *    level are capped at LRU_REFS_PROTECTED on promotion or deferral,
+ *    and at LRU_REFS_WORKINGSET under PID protection in the oldest
+ *    generation, where they represent a historical workingset.
+ *
+ * 6. Pages that reach LRU_REFS_MAX are advanced to the next generation
+ *    on further access, with refs capped to LRU_REFS_PROTECTED.  This
+ *    gives them a fair start for advancement to an even newer generation
+ *    while keeping hot pages distinguishable.
+ *
+ * Tiering uses PG_referenced and PG_workingset as the lower two bits,
+ * and the bits masked by LRU_REFS_MASK as the higher bits, so the refs
+ * count ranges from 0 to LRU_REFS_MAX.  A page is on the workingset
+ * tier once accessed at least twice, which is more consistent with the
+ * classical LRU.
+ *
+ * A page's referenced count never goes backwards except upon gen
+ * increase as described above, or when explicitly reset by
+ * page_reset_lru_refs().  Refault of a reclaimed page restores
+ * its referenced count, capped at LRU_REFS_PROTECTED, which aligns with
+ * promotion.  Page table refaults of previous workingset pages send
+ * them to the latest gen, driving aging faster.
+ *
+ * A page is active for /proc/vmstat and memory.stat when its referenced
+ * count reaches LRU_REFS_ACTIVATED (currently LRU_REFS_PROTECTED).
+ *
+ * MAX_NR_TIERS is set to 4 so that the multi-gen LRU can support twice
+ * the number of categories of the active/inactive LRU.
+ */
+#define MAX_NR_TIERS		4U
+#define LRU_TIER_MIN		0U
+#define LRU_TIER_MAX		(MAX_NR_TIERS - 1)
+
+/* Access source flags for page_inc_lru_refs() */
+#define LRU_REF_MAPPED		0x1U
+#define LRU_REF_EXEC		0x2U
+#define LRU_REF_FORCE		0x4U
+
+#define LRU_REFS_REFERENCED	0x1
+#define LRU_REFS_WORKINGSET	0x2
+#define LRU_REFS_PROTECTED	0x3
+#define LRU_REFS_ACTIVATED	LRU_REFS_PROTECTED
+
+#ifndef __GENERATING_BOUNDS_H
+
+#define LRU_GEN_MASK		((BIT(LRU_GEN_WIDTH) - 1) << LRU_GEN_PGOFF)
+#define LRU_REFS_MASK		((BIT(LRU_REFS_WIDTH) - 1) << LRU_REFS_PGOFF)
+#define LRU_REFS_FLAGS		(LRU_REFS_MASK | BIT(PG_referenced) | BIT(PG_workingset))
+#define LRU_REFS_MAX		(BIT(LRU_REFS_WIDTH + 2) - 1)
+
+struct lruvec;
+struct page_vma_mapped_walk;
+struct mem_cgroup;
+
+#ifdef CONFIG_LRU_GEN
+
+enum {
+	LRU_GEN_ANON,
+	LRU_GEN_FILE,
+};
+
+enum {
+	LRU_GEN_CORE,
+	LRU_GEN_MM_WALK,
+	LRU_GEN_NONLEAF_YOUNG,
+	NR_LRU_GEN_CAPS
+};
+
+#define MIN_LRU_BATCH		BITS_PER_LONG
+#define MAX_LRU_BATCH		(MIN_LRU_BATCH * 64)
+
+/* whether to keep historical stats from evicted generations */
+#ifdef CONFIG_LRU_GEN_STATS
+#define NR_HIST_GENS		MAX_NR_GENS
+#else
+#define NR_HIST_GENS		1U
+#endif
+
+/*
+ * The youngest generation number is stored in max_seq for both anon and file
+ * types as they are aged on an equal footing. The oldest generation numbers are
+ * stored in min_seq[] separately for anon and file types so that they can be
+ * incremented independently. Ideally min_seq[] are kept in sync when both anon
+ * and file types are evictable. However, to adapt to situations like extreme
+ * swappiness, they are allowed to be out of sync by at most
+ * MAX_NR_GENS-MIN_NR_GENS-1.
+ *
+ * The number of pages in each generation is eventually consistent and therefore
+ * can be transiently negative when reset_batch_size() is pending.
+ */
+struct lru_gen_folio {
+	/* the aging increments the youngest generation number */
+	unsigned long max_seq;
+	/* the eviction increments the oldest generation numbers */
+	unsigned long min_seq[ANON_AND_FILE];
+	/* the birth time of each generation in jiffies */
+	unsigned long timestamps[MAX_NR_GENS];
+	/* the multi-gen LRU lists, lazily sorted on eviction */
+	struct list_head folios[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+	/* the multi-gen LRU sizes, eventually consistent */
+	atomic_long_t nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+	/* the exponential moving average of refaulted */
+	unsigned long avg_refaulted[ANON_AND_FILE][MAX_NR_TIERS];
+	/* the exponential moving average of evicted+protected */
+	unsigned long avg_total[ANON_AND_FILE][MAX_NR_TIERS];
+	/* can only be modified under the LRU lock */
+	unsigned long protected[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS];
+	/* can be modified without holding the LRU lock */
+	atomic_long_t evicted[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS];
+	atomic_long_t refaulted[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS];
+	/* whether the multi-gen LRU is enabled */
+	bool enabled;
+	/* the memcg generation this lru_gen_folio belongs to */
+	u8 gen;
+	/* the list segment this lru_gen_folio belongs to */
+	u8 seg;
+	/* per-node lru_gen_folio list for global reclaim */
+	struct hlist_nulls_node list;
+};
+
+enum {
+	MM_LEAF_TOTAL,		/* total leaf entries */
+	MM_LEAF_YOUNG,		/* young leaf entries */
+	MM_NONLEAF_FOUND,	/* non-leaf entries found in Bloom filters */
+	MM_NONLEAF_ADDED,	/* non-leaf entries added to Bloom filters */
+	NR_MM_STATS
+};
+
+/* double-buffering Bloom filters */
+#define NR_BLOOM_FILTERS	2
+
+struct lru_gen_mm_state {
+	/* synced with max_seq after each iteration */
+	unsigned long seq;
+	/* where the current iteration continues after */
+	struct list_head *head;
+	/* where the last iteration ended before */
+	struct list_head *tail;
+	/* Bloom filters flip after each iteration */
+	unsigned long *filters[NR_BLOOM_FILTERS];
+	/* the mm stats for debugging */
+	unsigned long stats[NR_HIST_GENS][NR_MM_STATS];
+};
+
+struct lru_gen_mm_walk {
+	/* the lruvec under reclaim */
+	struct lruvec *lruvec;
+	/* max_seq from lru_gen_folio: can be out of date */
+	unsigned long seq;
+	/* the next address within an mm to scan */
+	unsigned long next_addr;
+	/* to batch activated pages */
+	int nr_activated[ANON_AND_FILE][MAX_NR_ZONES];
+	/* to batch promoted pages */
+	int nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+	/* to batch the mm stats */
+	int mm_stats[NR_MM_STATS];
+	/* total batched items */
+	int batched;
+	int swappiness;
+	bool force_scan;
+};
+
+/*
+ * For each node, memcgs are divided into two generations: the old and the
+ * young. For each generation, memcgs are randomly sharded into multiple bins
+ * to improve scalability. For each bin, the hlist_nulls is virtually divided
+ * into three segments: the head, the tail and the default.
+ *
+ * An onlining memcg is added to the tail of a random bin in the old generation.
+ * The eviction starts at the head of a random bin in the old generation. The
+ * per-node memcg generation counter, whose reminder (mod MEMCG_NR_GENS) indexes
+ * the old generation, is incremented when all its bins become empty.
+ *
+ * There are four operations:
+ * 1. MEMCG_LRU_HEAD, which moves a memcg to the head of a random bin in its
+ *    current generation (old or young) and updates its "seg" to "head";
+ * 2. MEMCG_LRU_TAIL, which moves a memcg to the tail of a random bin in its
+ *    current generation (old or young) and updates its "seg" to "tail";
+ * 3. MEMCG_LRU_OLD, which moves a memcg to the head of a random bin in the old
+ *    generation, updates its "gen" to "old" and resets its "seg" to "default";
+ * 4. MEMCG_LRU_YOUNG, which moves a memcg to the tail of a random bin in the
+ *    young generation, updates its "gen" to "young" and resets its "seg" to
+ *    "default".
+ *
+ * The events that trigger the above operations are:
+ * 1. Exceeding the soft limit, which triggers MEMCG_LRU_HEAD;
+ * 2. The first attempt to reclaim a memcg below low, which triggers
+ *    MEMCG_LRU_TAIL;
+ * 3. The first attempt to reclaim a memcg offlined or below reclaimable size
+ *    threshold, which triggers MEMCG_LRU_TAIL;
+ * 4. The second attempt to reclaim a memcg offlined or below reclaimable size
+ *    threshold, which triggers MEMCG_LRU_YOUNG;
+ * 5. Attempting to reclaim a memcg below min, which triggers MEMCG_LRU_YOUNG;
+ * 6. Finishing the aging on the eviction path, which triggers MEMCG_LRU_YOUNG;
+ * 7. Offlining a memcg, which triggers MEMCG_LRU_OLD.
+ *
+ * Notes:
+ * 1. Memcg LRU only applies to global reclaim, and the round-robin incrementing
+ *    of their max_seq counters ensures the eventual fairness to all eligible
+ *    memcgs. For memcg reclaim, it still relies on mem_cgroup_iter().
+ * 2. There are only two valid generations: old (seq) and young (seq+1).
+ *    MEMCG_NR_GENS is set to three so that when reading the generation counter
+ *    locklessly, a stale value (seq-1) does not wraparound to young.
+ */
+#define MEMCG_NR_GENS	3
+#define MEMCG_NR_BINS	8
+
+struct lru_gen_memcg {
+	/* the per-node memcg generation counter */
+	unsigned long seq;
+	/* each memcg has one lru_gen_folio per node */
+	unsigned long nr_memcgs[MEMCG_NR_GENS];
+	/* per-node lru_gen_folio list for global reclaim */
+	struct hlist_nulls_head	fifo[MEMCG_NR_GENS][MEMCG_NR_BINS];
+	/* protects the above */
+	spinlock_t lock;
+};
+
+void lru_gen_init_pgdat(struct pglist_data *pgdat);
+void lru_gen_exit_pgdat(struct pglist_data *pgdat);
+void lru_gen_init_lruvec(struct lruvec *lruvec);
+bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw, unsigned int nr);
+
+void lru_gen_init_memcg(struct mem_cgroup *memcg);
+void lru_gen_exit_memcg(struct mem_cgroup *memcg);
+void lru_gen_online_memcg(struct mem_cgroup *memcg);
+void lru_gen_offline_memcg(struct mem_cgroup *memcg);
+void lru_gen_release_memcg(struct mem_cgroup *memcg);
+void lru_gen_soft_reclaim(struct mem_cgroup *memcg, int nid);
+
+#else /* !CONFIG_LRU_GEN */
+
+static inline void lru_gen_init_pgdat(struct pglist_data *pgdat)
+{
+}
+
+static inline void lru_gen_exit_pgdat(struct pglist_data *pgdat)
+{
+}
+
+static inline void lru_gen_init_lruvec(struct lruvec *lruvec)
+{
+}
+
+static inline bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw,
+		unsigned int nr)
+{
+	return false;
+}
+
+static inline void lru_gen_init_memcg(struct mem_cgroup *memcg)
+{
+}
+
+static inline void lru_gen_exit_memcg(struct mem_cgroup *memcg)
+{
+}
+
+static inline void lru_gen_online_memcg(struct mem_cgroup *memcg)
+{
+}
+
+static inline void lru_gen_offline_memcg(struct mem_cgroup *memcg)
+{
+}
+
+static inline void lru_gen_release_memcg(struct mem_cgroup *memcg)
+{
+}
+
+static inline void lru_gen_soft_reclaim(struct mem_cgroup *memcg, int nid)
+{
+}
+
+#endif /* CONFIG_LRU_GEN */
 
 struct lruvec {
 	struct list_head		lists[NR_LRU_LISTS];
 	struct zone_reclaim_stat	reclaim_stat;
 	/* Evictions & activations on the inactive file list */
 	atomic_long_t			inactive_age;
-	/* Refaults at the time of last reclaim cycle */
-	unsigned long			refaults;
+	/* Refaults at the time of last reclaim cycle, anon=0, file=1 */
+	unsigned long			refaults[ANON_AND_FILE];
+#ifdef CONFIG_LRU_GEN
+	/* evictable pages divided into generations */
+	struct lru_gen_folio		lrugen;
+#ifdef CONFIG_LRU_GEN_WALKS_MMU
+	/* to concurrently iterate lru_gen_mm_list */
+	struct lru_gen_mm_state		mm_state;
+#endif
+#endif /* CONFIG_LRU_GEN */
 #ifdef CONFIG_MEMCG
 	struct pglist_data *pgdat;
 #endif
@@ -362,6 +764,8 @@ enum zone_type {
 };
 
 #ifndef __GENERATING_BOUNDS_H
+
+#define ASYNC_AND_SYNC 2
 
 struct zone {
 	/* Read-mostly fields */
@@ -491,8 +895,8 @@ struct zone {
 #if defined CONFIG_COMPACTION || defined CONFIG_CMA
 	/* pfn where compaction free scanner should start */
 	unsigned long		compact_cached_free_pfn;
-	/* pfn where async and sync compaction migration scanner should start */
-	unsigned long		compact_cached_migrate_pfn[2];
+	/* pfn where compaction migration scanner should start */
+	unsigned long		compact_cached_migrate_pfn[ASYNC_AND_SYNC];
 #endif
 
 #ifdef CONFIG_COMPACTION
@@ -665,12 +1069,25 @@ typedef struct pglist_data {
 	int node_id;
 	wait_queue_head_t kswapd_wait;
 	wait_queue_head_t pfmemalloc_wait;
+
+	/* workqueues for throttling reclaim for different reasons. */
+	wait_queue_head_t reclaim_wait[NR_VMSCAN_THROTTLE];
+
+	atomic_t nr_writeback_throttled;/* nr of writeback-throttled tasks */
+	unsigned long nr_reclaim_start;	/* nr pages written while throttled
+					 * when throttling started.
+					 */
 	struct task_struct *kswapd;	/* Protected by
 					   mem_hotplug_begin/end() */
 	int kswapd_order;
 	enum zone_type kswapd_classzone_idx;
 
 	int kswapd_failures;		/* Number of 'reclaimed == 0' runs */
+
+#define KCOMPRESS_FIFO_SIZE 256
+	wait_queue_head_t kcompressd_wait;
+	struct task_struct *kcompressd;
+	struct kfifo kcompress_fifo;
 
 #ifdef CONFIG_COMPACTION
 	int kcompactd_max_order;
@@ -732,6 +1149,13 @@ typedef struct pglist_data {
 	unsigned int inactive_ratio;
 
 	unsigned long		flags;
+
+#ifdef CONFIG_LRU_GEN
+	/* kswap mm walk data */
+	struct lru_gen_mm_walk mm_walk;
+	/* lru_gen_folio list */
+	struct lru_gen_memcg memcg_lru;
+#endif
 
 	ZONE_PADDING(_pad2_)
 

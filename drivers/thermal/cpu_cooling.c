@@ -37,6 +37,8 @@
 
 #include <trace/events/thermal.h>
 
+#define USE_LMH_DEV	0
+
 /*
  * Cooling state <-> CPUFreq frequency
  *
@@ -79,7 +81,6 @@ struct time_in_idle {
  * struct cpufreq_cooling_device - data for cooling device with cpufreq
  * @id: unique integer value corresponding to each cpufreq_cooling_device
  *	registered.
- * @cpu_id: The CPU for which the cooling device will do the mitigation.
  * @last_load: load measured by the latest call to cpufreq_get_requested_power()
  * @cpufreq_state: integer value representing the current state of cpufreq
  *	cooling	devices.
@@ -105,7 +106,6 @@ struct time_in_idle {
 struct cpufreq_cooling_device {
 	int id;
 	u32 last_load;
-	int cpu_id;
 	unsigned int cpufreq_state;
 	unsigned int clipped_freq;
 	unsigned int cpufreq_floor_state;
@@ -115,39 +115,16 @@ struct cpufreq_cooling_device {
 	struct thermal_cooling_device *cdev;
 	struct cpufreq_policy *policy;
 	struct list_head node;
+#ifndef CONFIG_SMP
 	struct time_in_idle *idle_time;
+#endif
 	get_static_t plat_get_static_power;
 	struct cpu_cooling_ops *plat_ops;
 };
 
-static atomic_t in_suspend;
-static int8_t cpuhp_registered;
-static struct work_struct cpuhp_register_work;
-static struct cpumask cpus_pending_online;
-static struct cpumask cpus_isolated_by_thermal;
-static DEFINE_MUTEX(core_isolate_lock);
-
 static DEFINE_IDA(cpufreq_ida);
 static DEFINE_MUTEX(cooling_list_lock);
 static LIST_HEAD(cpufreq_cdev_list);
-
-static struct cpumask cpus_in_max_cooling_level;
-static BLOCKING_NOTIFIER_HEAD(cpu_max_cooling_level_notifer);
-
-void cpu_cooling_max_level_notifier_register(struct notifier_block *n)
-{
-	blocking_notifier_chain_register(&cpu_max_cooling_level_notifer, n);
-}
-
-void cpu_cooling_max_level_notifier_unregister(struct notifier_block *n)
-{
-	blocking_notifier_chain_unregister(&cpu_max_cooling_level_notifer, n);
-}
-
-const struct cpumask *cpu_cooling_get_max_level_cpumask(void)
-{
-	return &cpus_in_max_cooling_level;
-}
 
 /* Below code defines functions to be used for cpufreq as cooling device */
 
@@ -171,116 +148,6 @@ static unsigned long get_level(struct cpufreq_cooling_device *cpufreq_cdev,
 	return level - 1;
 }
 
-static int cpufreq_cooling_pm_notify(struct notifier_block *nb,
-				unsigned long mode, void *_unused)
-{
-	struct cpufreq_cooling_device *cpufreq_cdev, *next;
-	unsigned int cpu;
-
-	switch (mode) {
-	case PM_HIBERNATION_PREPARE:
-	case PM_RESTORE_PREPARE:
-	case PM_SUSPEND_PREPARE:
-		atomic_set(&in_suspend, 1);
-		break;
-	case PM_POST_HIBERNATION:
-	case PM_POST_RESTORE:
-	case PM_POST_SUSPEND:
-		list_for_each_entry_safe(cpufreq_cdev, next, &cpufreq_cdev_list,
-						node) {
-			if (cpufreq_cdev->cpu_id == -1)
-				continue;
-			mutex_lock(&core_isolate_lock);
-			if (cpufreq_cdev->cpufreq_state ==
-				cpufreq_cdev->max_level) {
-				cpu = cpufreq_cdev->cpu_id;
-				/*
-				 * Unlock this lock before calling
-				 * schedule_isolate. as this could lead to
-				 * deadlock with hotplug path.
-				 */
-				mutex_unlock(&core_isolate_lock);
-				if (cpu_online(cpu) &&
-					!cpumask_test_and_set_cpu(cpu,
-					&cpus_isolated_by_thermal)) {
-					if (sched_isolate_cpu(cpu))
-						cpumask_clear_cpu(cpu,
-						&cpus_isolated_by_thermal);
-				}
-				continue;
-			}
-			mutex_unlock(&core_isolate_lock);
-		}
-
-		atomic_set(&in_suspend, 0);
-		break;
-	default:
-		break;
-	}
-	return 0;
-}
-
-static struct notifier_block cpufreq_cooling_pm_nb = {
-	.notifier_call = cpufreq_cooling_pm_notify,
-};
-
-static int cpufreq_hp_offline(unsigned int offline_cpu)
-{
-	struct cpufreq_cooling_device *cpufreq_cdev;
-
-	mutex_lock(&cooling_list_lock);
-	list_for_each_entry(cpufreq_cdev, &cpufreq_cdev_list, node) {
-		if (!cpumask_test_cpu(offline_cpu,
-					cpufreq_cdev->policy->related_cpus))
-			continue;
-		if (cpufreq_cdev->cpu_id != -1 &&
-				offline_cpu != cpufreq_cdev->cpu_id)
-			continue;
-
-		mutex_lock(&core_isolate_lock);
-		if ((cpufreq_cdev->cpufreq_state == cpufreq_cdev->max_level) &&
-			(cpumask_test_and_clear_cpu(offline_cpu,
-			&cpus_isolated_by_thermal)))
-			sched_unisolate_cpu_unlocked(offline_cpu);
-		mutex_unlock(&core_isolate_lock);
-		break;
-	}
-	mutex_unlock(&cooling_list_lock);
-
-	return 0;
-}
-
-static int cpufreq_hp_online(unsigned int online_cpu)
-{
-	struct cpufreq_cooling_device *cpufreq_cdev;
-	int ret = 0;
-
-	if (atomic_read(&in_suspend))
-		return 0;
-
-	mutex_lock(&cooling_list_lock);
-	list_for_each_entry(cpufreq_cdev, &cpufreq_cdev_list, node) {
-		if (!cpumask_test_cpu(online_cpu,
-					cpufreq_cdev->policy->related_cpus))
-			continue;
-		if (cpufreq_cdev->cpu_id != -1 &&
-				online_cpu != cpufreq_cdev->cpu_id)
-			continue;
-
-		mutex_lock(&core_isolate_lock);
-		if (cpufreq_cdev->cpufreq_state == cpufreq_cdev->max_level) {
-			cpumask_set_cpu(online_cpu, &cpus_pending_online);
-			ret = NOTIFY_BAD;
-		}
-		mutex_unlock(&core_isolate_lock);
-		break;
-	}
-	mutex_unlock(&cooling_list_lock);
-
-	return ret;
-}
-
-
 /**
  * cpufreq_thermal_notifier - notifier callback for cpufreq policy change.
  * @nb:	struct notifier_block * with callback info.
@@ -300,7 +167,7 @@ static int cpufreq_thermal_notifier(struct notifier_block *nb,
 	unsigned long clipped_freq = ULONG_MAX, floor_freq = 0;
 	struct cpufreq_cooling_device *cpufreq_cdev;
 
-	if (event != CPUFREQ_INCOMPATIBLE)
+	if (event != CPUFREQ_THERMAL)
 		return NOTIFY_DONE;
 
 	mutex_lock(&cooling_list_lock);
@@ -331,11 +198,34 @@ static int cpufreq_thermal_notifier(struct notifier_block *nb,
 	 * Similarly, if policy minimum set by the user is less than
 	 * the floor_frequency, then adjust the policy->min.
 	 */
-	if (policy->max > clipped_freq || policy->min < floor_freq)
-		cpufreq_verify_within_limits(policy, floor_freq, clipped_freq);
+	cpufreq_verify_within_limits(policy, floor_freq, clipped_freq);
 	mutex_unlock(&cooling_list_lock);
 
 	return NOTIFY_OK;
+}
+
+void cpu_limits_set_level(unsigned int cpu, unsigned int max_freq)
+{
+	struct cpufreq_cooling_device *cpufreq_cdev;
+	struct thermal_cooling_device *cdev;
+	unsigned int level;
+
+	list_for_each_entry(cpufreq_cdev, &cpufreq_cdev_list, node) {
+		if (cpufreq_cdev->id == cpu) {
+			for (level = 0; level < cpufreq_cdev->max_level; level++) {
+				int target_freq = cpufreq_cdev->freq_table[level].frequency;
+				if (max_freq >= target_freq) {
+					cdev = cpufreq_cdev->cdev;
+					if (cdev)
+						cdev->ops->set_cur_state(cdev, level);
+
+					break;
+				}
+			}
+
+			break;
+		}
+	}
 }
 
 /**
@@ -440,14 +330,23 @@ static u32 cpu_power_to_freq(struct cpufreq_cooling_device *cpufreq_cdev,
 }
 
 /**
- * get_load() - get load for a cpu since last updated
- * @cpufreq_cdev:	&struct cpufreq_cooling_device for this cpu
- * @cpu:	cpu number
- * @cpu_idx:	index of the cpu in time_in_idle*
+ * get_load() - get load for a cpu
+ * @cpufreq_cdev: struct cpufreq_cooling_device for the cpu
+ * @cpu: cpu number
+ * @cpu_idx: index of the cpu in time_in_idle array
  *
  * Return: The average load of cpu @cpu in percentage since this
  * function was last called.
  */
+#ifdef CONFIG_SMP
+static u32 get_load(struct cpufreq_cooling_device *cpufreq_cdev, int cpu,
+		    int cpu_idx)
+{
+	unsigned long util = sched_cpu_util(cpu);
+
+	return (util * 100) / arch_scale_cpu_capacity(cpu);
+}
+#else /* !CONFIG_SMP */
 static u32 get_load(struct cpufreq_cooling_device *cpufreq_cdev, int cpu,
 		    int cpu_idx)
 {
@@ -469,6 +368,7 @@ static u32 get_load(struct cpufreq_cooling_device *cpufreq_cdev, int cpu,
 
 	return load;
 }
+#endif /* CONFIG_SMP */
 
 /**
  * get_static_power() - calculate the static power consumed by the cpus
@@ -540,6 +440,36 @@ static u32 get_dynamic_power(struct cpufreq_cooling_device *cpufreq_cdev,
 	raw_cpu_power = cpu_freq_to_power(cpufreq_cdev, freq);
 	return (raw_cpu_power * cpufreq_cdev->last_load) / 100;
 }
+
+#ifdef CONFIG_SMP
+static inline int allocate_idle_time(struct cpufreq_cooling_device *cpufreq_cdev)
+{
+	return 0;
+}
+
+static inline void free_idle_time(struct cpufreq_cooling_device *cpufreq_cdev)
+{
+}
+#else
+static int allocate_idle_time(struct cpufreq_cooling_device *cpufreq_cdev)
+{
+	unsigned int num_cpus = cpumask_weight(cpufreq_cdev->policy->related_cpus);
+
+	cpufreq_cdev->idle_time = kcalloc(num_cpus,
+					  sizeof(*cpufreq_cdev->idle_time),
+					  GFP_KERNEL);
+	if (!cpufreq_cdev->idle_time)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static void free_idle_time(struct cpufreq_cooling_device *cpufreq_cdev)
+{
+	kfree(cpufreq_cdev->idle_time);
+	cpufreq_cdev->idle_time = NULL;
+}
+#endif /* CONFIG_SMP */
 
 /* cpufreq cooling device callback functions are defined below */
 
@@ -666,70 +596,41 @@ static int cpufreq_set_cur_state(struct thermal_cooling_device *cdev,
 				 unsigned long state)
 {
 	struct cpufreq_cooling_device *cpufreq_cdev = cdev->devdata;
+	struct cpumask *cpus;
 	unsigned int clip_freq;
-	unsigned long prev_state;
-	struct device *cpu_dev;
-	int ret = 0;
-	int cpu = 0;
+	int cpu = cpufreq_cdev->policy->cpu;
 
 	/* Request state should be less than max_level */
 	if (WARN_ON(state > cpufreq_cdev->max_level))
-		return -EINVAL;
+		state = cpufreq_cdev->max_level;
 
 	/* Check if the old cooling action is same as new cooling action */
 	if (cpufreq_cdev->cpufreq_state == state)
 		return 0;
 
-	mutex_lock(&core_isolate_lock);
-	cpu = (cpufreq_cdev->cpu_id == -1) ?
-		cpufreq_cdev->policy->cpu : cpufreq_cdev->cpu_id;
-	prev_state = cpufreq_cdev->cpufreq_state;
-	cpufreq_cdev->cpufreq_state = state;
-	mutex_unlock(&core_isolate_lock);
-	/* If state is the last, isolate the CPU */
-	if (state == cpufreq_cdev->max_level) {
-		if (cpu_online(cpu) &&
-			(!cpumask_test_and_set_cpu(cpu,
-			&cpus_isolated_by_thermal))) {
-			if (sched_isolate_cpu(cpu))
-				cpumask_clear_cpu(cpu,
-					&cpus_isolated_by_thermal);
-		}
-		cpumask_set_cpu(cpu, &cpus_in_max_cooling_level);
-		blocking_notifier_call_chain(&cpu_max_cooling_level_notifer,
-					     1, (void *)(long)cpu);
-		return ret;
-	} else if ((prev_state == cpufreq_cdev->max_level)
-			&& (state < cpufreq_cdev->max_level)) {
-		if (cpumask_test_and_clear_cpu(cpu, &cpus_pending_online)) {
-			cpu_dev = get_cpu_device(cpu);
-			ret = device_online(cpu_dev);
-			if (ret)
-				pr_err("CPU:%d online error:%d\n", cpu, ret);
-			goto update_frequency;
-		} else if (cpumask_test_and_clear_cpu(cpu,
-			&cpus_isolated_by_thermal)) {
-			sched_unisolate_cpu(cpu);
-		}
-		cpumask_clear_cpu(cpu, &cpus_in_max_cooling_level);
-		blocking_notifier_call_chain(&cpu_max_cooling_level_notifer,
-					     0, (void *)(long)cpu);
-	}
-update_frequency:
 	clip_freq = cpufreq_cdev->freq_table[state].frequency;
 	cpufreq_cdev->cpufreq_state = state;
 	cpufreq_cdev->clipped_freq = clip_freq;
+
+	cpus = cpufreq_cdev->policy->related_cpus;
+	arch_update_thermal_pressure(cpus, clip_freq);
 
 	/* Check if the device has a platform mitigation function that
 	 * can handle the CPU freq mitigation, if not, notify cpufreq
 	 * framework.
 	 */
-	if (cpufreq_cdev->plat_ops) {
+	if (USE_LMH_DEV && cpufreq_cdev->plat_ops) {
 		if (cpufreq_cdev->plat_ops->ceil_limit)
 			cpufreq_cdev->plat_ops->ceil_limit(cpu,
 						clip_freq);
-	} else {
+
+		get_online_cpus();
 		cpufreq_update_policy(cpu);
+		put_online_cpus();
+	} else {
+		get_online_cpus();
+		cpufreq_update_policy(cpu);
+		put_online_cpus();
 	}
 
 	return 0;
@@ -939,16 +840,6 @@ static unsigned int find_next_max(struct cpufreq_frequency_table *table,
 	return max;
 }
 
-static void register_cdev(struct work_struct *work)
-{
-	int ret = 0;
-
-	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
-				"cpu_cooling/no-sched",	cpufreq_hp_online,
-				cpufreq_hp_offline);
-	if (ret < 0)
-		pr_err("Error registering for hotpug callback:%d\n", ret);
-}
 /**
  * __cpufreq_cooling_register - helper function to create cpufreq cooling device
  * @np: a valid struct device_node to the cooling device device tree node
@@ -978,7 +869,7 @@ __cpufreq_cooling_register(struct device_node *np,
 	struct thermal_cooling_device *cdev;
 	struct cpufreq_cooling_device *cpufreq_cdev;
 	char dev_name[THERMAL_NAME_LENGTH];
-	unsigned int freq, i, num_cpus, cpu_idx;
+	unsigned int freq, i;
 	int ret;
 	struct thermal_cooling_device_ops *cooling_ops;
 	bool first;
@@ -1000,20 +891,11 @@ __cpufreq_cooling_register(struct device_node *np,
 		return ERR_PTR(-ENOMEM);
 
 	cpufreq_cdev->policy = policy;
-	num_cpus = cpumask_weight(policy->related_cpus);
-	cpufreq_cdev->idle_time = kcalloc(num_cpus,
-					 sizeof(*cpufreq_cdev->idle_time),
-					 GFP_KERNEL);
-	if (!cpufreq_cdev->idle_time) {
-		cdev = ERR_PTR(-ENOMEM);
+
+	ret = allocate_idle_time(cpufreq_cdev);
+	if (ret) {
+		cdev = ERR_PTR(ret);
 		goto free_cdev;
-	}
-	cpufreq_cdev->cpu_id = -1;
-	for_each_cpu(cpu_idx, policy->related_cpus) {
-		if (np == of_cpu_device_node_get(cpu_idx)) {
-			cpufreq_cdev->cpu_id = cpu_idx;
-			break;
-		}
 	}
 
 	/* Last level will indicate the core will be isolated. */
@@ -1051,9 +933,6 @@ __cpufreq_cooling_register(struct device_node *np,
 			pr_debug("%s: freq:%u KHz\n", __func__, freq);
 	}
 
-	/* Max level index is for core isolation, set this level as zero */
-	cpufreq_cdev->freq_table[cpufreq_cdev->max_level].frequency = 0;
-
 	if (capacitance) {
 		cpufreq_cdev->plat_get_static_power = plat_static_func;
 
@@ -1087,18 +966,9 @@ __cpufreq_cooling_register(struct device_node *np,
 	list_add(&cpufreq_cdev->node, &cpufreq_cdev_list);
 	mutex_unlock(&cooling_list_lock);
 
-	if (first && !cpufreq_cdev->plat_ops)
+	if (first)
 		cpufreq_register_notifier(&thermal_cpufreq_notifier_block,
 					  CPUFREQ_POLICY_NOTIFIER);
-	if (!cpuhp_registered) {
-		cpuhp_registered = 1;
-		register_pm_notifier(&cpufreq_cooling_pm_nb);
-		cpumask_clear(&cpus_pending_online);
-		cpumask_clear(&cpus_isolated_by_thermal);
-		cpumask_clear(&cpus_in_max_cooling_level);
-		INIT_WORK(&cpuhp_register_work, register_cdev);
-		queue_work(system_wq, &cpuhp_register_work);
-	}
 
 	return cdev;
 
@@ -1107,7 +977,7 @@ remove_ida:
 free_table:
 	kfree(cpufreq_cdev->freq_table);
 free_idle_time:
-	kfree(cpufreq_cdev->idle_time);
+	free_idle_time(cpufreq_cdev);
 free_cdev:
 	kfree(cpufreq_cdev);
 	return cdev;
@@ -1278,17 +1148,14 @@ void cpufreq_cooling_unregister(struct thermal_cooling_device *cdev)
 	last = list_empty(&cpufreq_cdev_list);
 	mutex_unlock(&cooling_list_lock);
 
-	if (last) {
-		unregister_pm_notifier(&cpufreq_cooling_pm_nb);
-		if (!cpufreq_cdev->plat_ops)
-			cpufreq_unregister_notifier(
-					&thermal_cpufreq_notifier_block,
-					CPUFREQ_POLICY_NOTIFIER);
-	}
+	if (last)
+		cpufreq_unregister_notifier(
+				&thermal_cpufreq_notifier_block,
+				CPUFREQ_POLICY_NOTIFIER);
 
 	thermal_cooling_device_unregister(cpufreq_cdev->cdev);
 	ida_simple_remove(&cpufreq_ida, cpufreq_cdev->id);
-	kfree(cpufreq_cdev->idle_time);
+	free_idle_time(cpufreq_cdev);
 	kfree(cpufreq_cdev->freq_table);
 	kfree(cpufreq_cdev);
 }

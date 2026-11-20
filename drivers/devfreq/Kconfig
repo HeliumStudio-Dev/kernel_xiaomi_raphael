@@ -263,6 +263,20 @@ config DEVFREQ_GOV_CDSPL3
 	  CDSP resource manager will use this governor to vote for L3 clock
 	  for IO-coherent traffic generated from CDSP
 
+config ARM_QCOM_DEVFREQ_FW
+	bool "Qualcomm Technologies Inc. DEVFREQ FW driver"
+	depends on ARCH_QCOM
+	select DEVFREQ_GOV_PERFORMANCE
+	select DEVFREQ_GOV_POWERSAVE
+	select DEVFREQ_GOV_USERSPACE
+	default n
+	help
+	  The firmware present in some QCOM chipsets offloads the steps
+	  necessary for changing the frequency of some devices (Eg: L3). This
+	  driver implements the devfreq interface for this firmware so that
+	  various governors could be used to scale the frequency of these
+	  devices.
+
 source "drivers/devfreq/event/Kconfig"
 
 endif # PM_DEVFREQ

@@ -5600,6 +5600,7 @@ void ipa3_dec_client_disable_clks_no_block(
 		&ipa_dec_clients_disable_clks_on_wq_work, 0);
 }
 
+#if 0
 /**
  * ipa3_inc_acquire_wakelock() - Increase active clients counter, and
  * acquire wakelock if necessary
@@ -5640,6 +5641,7 @@ void ipa3_dec_release_wakelock(void)
 		__pm_relax(&ipa3_ctx->w_lock);
 	spin_unlock_irqrestore(&ipa3_ctx->wakelock_ref_cnt.spinlock, flags);
 }
+#endif
 
 int ipa3_set_clock_plan_from_pm(int idx)
 {
@@ -5837,11 +5839,13 @@ void ipa3_suspend_handler(enum ipa_irq_type interrupt,
 					atomic_set(
 					&ipa3_ctx->transport_pm.dec_clients,
 					1);
+#if 0
 					/*
 					 * acquire wake lock as long as suspend
 					 * vote is held
 					 */
 					ipa3_inc_acquire_wakelock();
+#endif
 					ipa3_process_irq_schedule_rel();
 				}
 				mutex_unlock(pm_mutex_ptr);
@@ -5918,7 +5922,9 @@ static void ipa3_transport_release_resource(struct work_struct *work)
 			ipa3_process_irq_schedule_rel();
 		} else {
 			atomic_set(&ipa3_ctx->transport_pm.dec_clients, 0);
+#if 0
 			ipa3_dec_release_wakelock();
+#endif
 			IPA_ACTIVE_CLIENTS_DEC_SPECIAL("TRANSPORT_RESOURCE");
 		}
 	}
@@ -7392,9 +7398,11 @@ static int ipa3_pre_init(const struct ipa3_plat_drv_res *resource_p,
 
 	ipa3_debugfs_pre_init();
 
+#if 0
 	/* Create a wakeup source. */
 	wakeup_source_init(&ipa3_ctx->w_lock, "IPA_WS");
 	spin_lock_init(&ipa3_ctx->wakelock_ref_cnt.spinlock);
+#endif
 
 	/* Initialize Power Management framework */
 	if (ipa3_ctx->use_ipa_pm) {

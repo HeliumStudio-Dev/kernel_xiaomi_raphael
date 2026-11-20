@@ -403,7 +403,7 @@ static void ping_other_cpus(struct msm_watchdog_data *wdog_dd)
 	/* Make sure alive mask is cleared and set in order */
 	smp_mb();
 	for_each_cpu(cpu, cpu_online_mask) {
-		if (!cpu_idle_pc_state[cpu] && !cpu_isolated(cpu)) {
+		if (!cpu_idle_pc_state[cpu]) {
 			wdog_dd->ping_start[cpu] = sched_clock();
 			smp_call_function_single(cpu, keep_alive_response,
 						 wdog_dd, 1);
@@ -563,6 +563,9 @@ static void configure_bark_dump(struct msm_watchdog_data *wdog_dd)
 	struct msm_dump_data *cpu_data;
 	int cpu;
 	void *cpu_buf;
+
+	if (!IS_ENABLED(CONFIG_QCOM_MEMORY_DUMP_V2))
+		return;
 
 	cpu_data = kcalloc(num_present_cpus(), sizeof(struct msm_dump_data),
 								GFP_KERNEL);

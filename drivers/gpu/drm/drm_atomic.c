@@ -30,6 +30,7 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_mode.h>
 #include <drm/drm_print.h>
+#include <linux/pm_qos.h>
 #include <linux/sync_file.h>
 
 #include "drm_crtc_internal.h"
@@ -1095,9 +1096,21 @@ drm_atomic_get_connector_state(struct drm_atomic_state *state,
 		struct __drm_connnectors_state *c;
 		int alloc = max(index + 1, config->num_connector);
 
-		c = krealloc(state->connectors, alloc * sizeof(*state->connectors), GFP_KERNEL);
-		if (!c)
-			return ERR_PTR(-ENOMEM);
+		if (state->connectors_preallocated) {
+			state->connectors_preallocated = false;
+			c = kmalloc(alloc * sizeof(*state->connectors),
+				    GFP_KERNEL);
+			if (!c)
+				return ERR_PTR(-ENOMEM);
+			memcpy(c, state->connectors,
+			       sizeof(*state->connectors) * state->num_connector);
+		} else {
+			c = krealloc(state->connectors,
+				     alloc * sizeof(*state->connectors),
+				     GFP_KERNEL);
+			if (!c)
+				return ERR_PTR(-ENOMEM);
+		}
 
 		state->connectors = c;
 		memset(&state->connectors[state->num_connector], 0,
@@ -2204,8 +2217,8 @@ static void complete_crtc_signaling(struct drm_device *dev,
 	kfree(fence_state);
 }
 
-int drm_mode_atomic_ioctl(struct drm_device *dev,
-			  void *data, struct drm_file *file_priv)
+static int __drm_mode_atomic_ioctl(struct drm_device *dev, void *data,
+				   struct drm_file *file_priv)
 {
 	struct drm_mode_atomic *arg = data;
 	uint32_t __user *objs_ptr = (uint32_t __user *)(unsigned long)(arg->objs_ptr);
@@ -2368,6 +2381,28 @@ out:
 
 	drm_modeset_drop_locks(&ctx);
 	drm_modeset_acquire_fini(&ctx);
+
+	return ret;
+}
+
+int drm_mode_atomic_ioctl(struct drm_device *dev, void *data,
+			  struct drm_file *file_priv)
+{
+	/*
+	 * Optimistically assume the current task won't migrate to another CPU
+	 * and restrict the current CPU to shallow idle states so that it won't
+	 * take too long to finish running the ioctl whenever the ioctl runs a
+	 * command that sleeps, such as for an "atomic" commit.
+	 */
+	struct pm_qos_request req = {
+		.type = PM_QOS_REQ_AFFINE_CORES,
+		.cpus_affine = BIT(raw_smp_processor_id())
+	};
+	int ret;
+
+	pm_qos_add_request(&req, PM_QOS_CPU_DMA_LATENCY, 100);
+	ret = __drm_mode_atomic_ioctl(dev, data, file_priv);
+	pm_qos_remove_request(&req);
 
 	return ret;
 }

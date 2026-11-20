@@ -76,6 +76,7 @@ extern void __enable_irq(struct irq_desc *desc);
 #define IRQ_START_COND	false
 
 extern int irq_startup(struct irq_desc *desc, bool resend, bool force);
+extern void irq_startup_managed(struct irq_desc *desc);
 
 extern void irq_shutdown(struct irq_desc *desc);
 extern void irq_enable(struct irq_desc *desc);
@@ -117,6 +118,15 @@ static inline void unregister_handler_proc(unsigned int irq,
 					   struct irqaction *action) { }
 #endif
 
+#ifdef CONFIG_IRQ_SBALANCE
+extern void sbalance_desc_add(struct irq_desc *desc);
+extern void sbalance_desc_del(struct irq_desc *desc);
+#else
+static inline void sbalance_desc_add(struct irq_desc *desc) { }
+static inline void sbalance_desc_del(struct irq_desc *desc) { }
+#endif
+
+extern bool __irq_can_set_affinity(struct irq_desc *desc);
 extern bool irq_can_set_affinity_usr(unsigned int irq);
 
 extern void irq_set_thread_affinity(struct irq_desc *desc);
@@ -240,6 +250,9 @@ static inline void irq_state_set_masked(struct irq_desc *desc)
 
 static inline void __kstat_incr_irqs_this_cpu(struct irq_desc *desc)
 {
+#ifdef CONFIG_IRQ_SBALANCE
+	WRITE_ONCE(desc->last_cpu, raw_smp_processor_id());
+#endif
 	__this_cpu_inc(*desc->kstat_irqs);
 	__this_cpu_inc(kstat.irqs_sum);
 }

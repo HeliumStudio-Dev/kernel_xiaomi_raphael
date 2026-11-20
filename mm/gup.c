@@ -4,6 +4,7 @@
 #include <linux/spinlock.h>
 
 #include <linux/mm.h>
+#include <linux/mm_inline.h>
 #include <linux/memremap.h>
 #include <linux/pagemap.h>
 #include <linux/rmap.h>
@@ -1526,7 +1527,7 @@ static int gup_pte_range(pmd_t pmd, unsigned long addr, unsigned long end,
 		VM_BUG_ON_PAGE(compound_head(page) != head, page);
 
 		put_dev_pagemap(pgmap);
-		SetPageReferenced(page);
+		page_inc_lru_refs_fast(page);
 		pages[*nr] = page;
 		(*nr)++;
 
@@ -1571,7 +1572,7 @@ static int __gup_device_huge(unsigned long pfn, unsigned long addr,
 			undo_dev_pagemap(nr, nr_start, pages);
 			return 0;
 		}
-		SetPageReferenced(page);
+		page_inc_lru_refs_fast(page);
 		pages[*nr] = page;
 		get_page(page);
 		put_dev_pagemap(pgmap);
@@ -1664,7 +1665,7 @@ static int gup_huge_pmd(pmd_t orig, pmd_t *pmdp, unsigned long addr,
 		return 0;
 	}
 
-	SetPageReferenced(head);
+	page_inc_lru_refs_fast(head);
 	return 1;
 }
 
@@ -1702,7 +1703,7 @@ static int gup_huge_pud(pud_t orig, pud_t *pudp, unsigned long addr,
 		return 0;
 	}
 
-	SetPageReferenced(head);
+	page_inc_lru_refs_fast(head);
 	return 1;
 }
 
@@ -1739,7 +1740,7 @@ static int gup_huge_pgd(pgd_t orig, pgd_t *pgdp, unsigned long addr,
 		return 0;
 	}
 
-	SetPageReferenced(head);
+	page_inc_lru_refs_fast(head);
 	return 1;
 }
 

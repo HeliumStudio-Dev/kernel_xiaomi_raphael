@@ -16,6 +16,7 @@
  *
  */
 #include <linux/mm.h>
+#include <linux/mm_inline.h>
 #include <linux/swap.h>
 #include <linux/bio.h>
 #include <linux/blkdev.h>

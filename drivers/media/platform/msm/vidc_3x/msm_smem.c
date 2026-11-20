@@ -97,9 +97,6 @@ static int msm_dma_get_device_address(struct dma_buf *dbuf, unsigned long align,
 		}
 
 		/* debug trace's need to be updated later */
-		trace_msm_smem_buffer_iommu_op_start("MAP", 0, 0,
-			align, *iova, *buffer_size);
-
 		if (table->sgl) {
 			*iova = table->sgl->dma_address;
 			*buffer_size = table->sgl->dma_length;
@@ -116,8 +113,6 @@ static int msm_dma_get_device_address(struct dma_buf *dbuf, unsigned long align,
 		mapping_info->buf = dbuf;
 		mapping_info->cb_info = (void *)cb;
 
-		trace_msm_smem_buffer_iommu_op_end("MAP", 0, 0,
-			align, *iova, *buffer_size);
 	} else {
 		dprintk(VIDC_DBG, "iommu not present, use phys mem addr\n");
 	}
@@ -151,12 +146,9 @@ static int msm_dma_put_device_address(u32 flags,
 		return -EINVAL;
 	}
 
-	trace_msm_smem_buffer_iommu_op_start("UNMAP", 0, 0, 0, 0, 0);
 	dma_buf_unmap_attachment(mapping_info->attach,
 		mapping_info->table, DMA_BIDIRECTIONAL);
 	dma_buf_detach(mapping_info->buf, mapping_info->attach);
-	trace_msm_smem_buffer_iommu_op_end("UNMAP", 0, 0, 0, 0, 0);
-
 	mapping_info->dev = NULL;
 	mapping_info->mapping = NULL;
 	mapping_info->table = NULL;
@@ -447,8 +439,6 @@ static int alloc_dma_mem(size_t size, u32 align, u32 flags,
 		flags |= SMEM_SECURE;
 	}
 
-	trace_msm_smem_buffer_dma_op_start("ALLOC", (u32)buffer_type,
-		heap_mask, size, align, flags, map_kernel);
 	dbuf = ion_alloc(size, heap_mask, ion_flags);
 	if (IS_ERR_OR_NULL(dbuf)) {
 		dprintk(VIDC_ERR,
@@ -457,9 +447,6 @@ static int alloc_dma_mem(size_t size, u32 align, u32 flags,
 		rc = -ENOMEM;
 		goto fail_shared_mem_alloc;
 	}
-	trace_msm_smem_buffer_dma_op_end("ALLOC", (u32)buffer_type,
-		heap_mask, size, align, flags, map_kernel);
-
 	mem->flags = flags;
 	mem->buffer_type = buffer_type;
 	mem->offset = 0;
@@ -530,13 +517,8 @@ static int free_dma_mem(struct msm_smem *mem)
 	}
 
 	if (mem->dma_buf) {
-		trace_msm_smem_buffer_dma_op_start("FREE",
-				(u32)mem->buffer_type, -1, mem->size, -1,
-				mem->flags, -1);
 		dma_buf_put(mem->dma_buf);
 		mem->dma_buf = NULL;
-		trace_msm_smem_buffer_dma_op_end("FREE", (u32)mem->buffer_type,
-			-1, mem->size, -1, mem->flags, -1);
 	}
 
 	return rc;
